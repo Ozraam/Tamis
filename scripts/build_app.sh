@@ -29,9 +29,17 @@ python -m PyInstaller \
     --osx-bundle-identifier io.github.ozraam.tamis \
     --collect-binaries rawpy \
     --copy-metadata tamis \
+    --exclude-module PyQt6.QtDBus \
+    --exclude-module PyQt6.QtNetwork \
     --add-data tamis/resources:tamis/resources \
     ${icon_args[@]+"${icon_args[@]}"} \
     Tamis.py
+
+# Qt plugins Tamis doesn't use, and the frameworks only they need: PDFs as images
+# (QtPdf, which pulls QtNetwork in) and TUIO touch over the network.
+find dist/Tamis.app dist/Tamis -depth \( -name "libqpdf.*" -o -name "libqtuiotouchplugin.*" \
+    -o -name "QtPdf.framework" -o -name "QtNetwork.framework" -o -name "*Qt6Pdf*" -o -name "*Qt6Network*" \) \
+    -exec rm -rf {} + 2>/dev/null || true
 
 if [[ "$(uname)" == "Darwin" ]]; then
     plist=dist/Tamis.app/Contents/Info.plist

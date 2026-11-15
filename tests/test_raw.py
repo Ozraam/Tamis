@@ -118,3 +118,49 @@ def test_a_raw_is_exported_from_its_development(tmp_path):
     assert exported.shape == (48, 64, 3)
     red, green, _blue = exported[30, 40]
     assert not (red > 150 * 257 and green < 80 * 257)  # developed, not the red preview
+
+
+def half_sizes(monkeypatch):
+    """The `half_size` LibRaw is asked for, in order."""
+    asked = []
+    real_imread = editing.rawpy.imread
+
+    class Spy:
+        def __init__(self, path):
+            self.raw = real_imread(path)
+            self.sizes = self.raw.sizes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.raw.close()
+
+        def postprocess(self, **options):
+            asked.append(options["half_size"])
+            return self.raw.postprocess(**options)
+
+    monkeypatch.setattr(editing.rawpy, "imread", Spy)
+    return asked
+
+
+def test_a_small_export_develops_the_raw_at_half_size(tmp_path, monkeypatch):
+    path = write_dng(tmp_path / "IMG_1.dng", width=128, height=96)
+    asked = half_sizes(monkeypatch)
+    small = editing.export_photo(path, {"exposure": 0.5}, None, str(tmp_path / "out"), name="small.jpg", long_edge=60)
+    large = editing.export_photo(path, {"exposure": 0.5}, None, str(tmp_path / "out"), name="large.jpg", long_edge=100)
+    full = editing.export_photo(path, {"exposure": 0.5}, None, str(tmp_path / "out"), name="full.jpg")
+    assert asked == [True, False, False]
+    assert QImage(small).size() == QSize(60, 45)
+    assert QImage(large).size() == QSize(100, 75)
+    assert QImage(full).size() == QSize(128, 96)
+    # As bright either way.
+    assert image_to_array(QImage(small)).mean() == pytest.approx(image_to_array(QImage(large)).mean(), rel=0.03)
+
+
+def test_half_size_is_enough_only_if_the_crop_still_gives_the_long_edge():
+    assert editing.half_size_will_do(6000, 4000, {}, 2048)
+    assert not editing.half_size_will_do(6000, 4000, {}, 3001)
+    assert not editing.half_size_will_do(6000, 4000, {"crop": [0, 0, 0.5, 1]}, 2048)  # 1500 × 2000 at half size
+    assert editing.half_size_will_do(6000, 4000, {"crop": [0, 0, 0.5, 1]}, 1500)
+    assert not editing.half_size_will_do(6000, 4000, {}, 0)

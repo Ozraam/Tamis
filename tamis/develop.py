@@ -226,14 +226,30 @@ def encode(linear):
     return _ENCODE[index]
 
 
-def shoulder(rgb):
-    """The highlight roll-off of RAWs (process 2): unchanged below RAW_SHOULDER, then towards 1, never reaching it."""
+def shoulder(rgb, out=None):
+    """The highlight roll-off of RAWs (process 2): unchanged below RAW_SHOULDER, then towards 1, never reaching it.
+
+    With `out` (which may be `rgb` itself) the result is written there.
+    """
     t = np.float32(RAW_SHOULDER)
     above = rgb > t
+    if out is None:
+        out = rgb.copy()
+    elif out is not rgb:
+        np.copyto(out, rgb)
     if not above.any():
-        return rgb
-    rolled = t + (1 - t) * -np.expm1(-(np.maximum(rgb, t) - t) / (1 - t))
-    return np.where(above, rolled, rgb).astype(np.float32, copy=False)
+        return out
+    # t + (1 - t) * -expm1(-(max(rgb, t) - t) / (1 - t)), with a single temporary array.
+    rolled = np.maximum(rgb, t)
+    rolled -= t
+    np.negative(rolled, out=rolled)
+    rolled /= 1 - t
+    np.expm1(rolled, out=rolled)
+    np.negative(rolled, out=rolled)
+    rolled *= 1 - t
+    rolled += t
+    np.copyto(out, rolled, where=above)
+    return out
 
 
 def _smoothstep(low, high, x):
@@ -287,41 +303,76 @@ def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=
     height, width = linear.shape[:2]
     full_height, full_width = full_size or (height, width)
 
-    rgb = linear * (_white_balance(s["temperature"], s["tint"]) * np.float32(2.0 ** s["exposure"]))
+    # Every step works in place on `rgb`, then `out`, so a large image is not copied at each step.
+    rgb = np.multiply(linear, _white_balance(s["temperature"], s["tint"]) * np.float32(2.0 ** s["exposure"]))
 
     if s["highlights"] or s["shadows"]:
-        perceived = encode(rgb @ LUMA)
+        perceived = _encode_in_place(rgb @ LUMA)
         stops = np.zeros((height, width), dtype=np.float32)
         if s["highlights"]:
             stops += s["highlights"] / 100 * _smoothstep(0.45, 1.0, perceived)
         if s["shadows"]:
             stops += s["shadows"] / 100 * 1.5 * (1 - _smoothstep(0.0, 0.5, perceived))
-        rgb *= np.exp2(stops)[..., None]
+        del perceived
+        np.exp2(stops, out=stops)
+        rgb *= stops[..., None]
+        del stops
 
     if raw and edit.get("process", PROCESS) >= 2:  # (not settings(): clean() drops a process left alone)
-        rgb = shoulder(rgb)
+        shoulder(rgb, out=rgb)
 
     tone = _tone_table(s["contrast"])
-    out = tone[(np.clip(rgb, 0.0, 1.0) * _ENCODE_STEPS).astype(np.uint16)]
+    np.clip(rgb, 0.0, 1.0, out=rgb)
+    rgb *= _ENCODE_STEPS
+    index = rgb.astype(np.uint16)
+    del rgb  # freed before the result is allocated (np.take(out=) would copy the index to 64 bits)
+    out = tone[index]
+    del index
 
     if s["saturation"]:
         grey = (out @ LUMA)[..., None]
-        out = np.clip(grey + (out - grey) * np.float32(1 + s["saturation"] / 100), 0.0, 1.0)
+        out -= grey
+        out *= np.float32(1 + s["saturation"] / 100)
+        out += grey
+        np.clip(out, 0.0, 1.0, out=out)
+        del grey
 
     if table is not None and s["lut_strength"]:
-        graded = apply_lut((out * 255 + 0.5).astype(np.uint8), table).astype(np.float32) / 255
+        graded = apply_lut(_to_uint8(out.copy()), table).astype(np.float32)
+        graded /= 255
         strength = s["lut_strength"] / 100
-        out = graded if strength >= 1 else out + (graded - out) * np.float32(strength)
+        if strength >= 1:
+            out = graded
+        else:
+            graded -= out
+            graded *= np.float32(strength)
+            out += graded
+        del graded
 
     if s["vignette"]:
         rows = (np.arange(origin[0], origin[0] + height, dtype=np.float32) + 0.5) / full_height * 2 - 1
         cols = (np.arange(origin[1], origin[1] + width, dtype=np.float32) + 0.5) / full_width * 2 - 1
         radius = (rows[:, None] ** 2 + cols[None, :] ** 2) / 2  # 0 at the centre, 1 in the corners
-        out = out * (1 + s["vignette"] / 100 * 0.9 * _smoothstep(0.1, 1.0, radius))[..., None]
+        out *= (1 + s["vignette"] / 100 * 0.9 * _smoothstep(0.1, 1.0, radius))[..., None]
 
     if s["grain"]:
         noise = _grain((height, width), origin, full_width, s["grain"], s["grain_size"], seed)
         luma = np.clip(out @ LUMA, 0.0, 1.0)
-        out = out + (noise * (0.35 + 2.6 * luma * (1 - luma)))[..., None]  # strongest in the midtones
+        out += (noise * (0.35 + 2.6 * luma * (1 - luma)))[..., None]  # strongest in the midtones
 
-    return (np.clip(out, 0.0, 1.0) * 255 + 0.5).astype(np.uint8)
+    np.clip(out, 0.0, 1.0, out=out)
+    return _to_uint8(out)
+
+
+def _encode_in_place(linear):
+    """encode(), overwriting `linear` (float32) on the way."""
+    np.clip(linear, 0.0, 1.0, out=linear)
+    linear *= _ENCODE_STEPS
+    return _ENCODE[linear.astype(np.uint16)]
+
+
+def _to_uint8(values):
+    """[0, 1] floats -> uint8, rounded; overwrites `values` on the way."""
+    values *= 255
+    values += 0.5
+    return values.astype(np.uint8)

@@ -11,6 +11,7 @@ gallery, one at a time, at low priority.
 """
 import hashlib
 import json
+import logging
 import os
 import threading
 import zlib
@@ -30,6 +31,8 @@ from .imaging import array_to_image, image_to_array, resize_array, to_srgb
 from .loader import file_state, pixmap_bytes, thumbnail_decode_size
 from .workers import emit_safely
 
+log = logging.getLogger(__name__)
+
 EDIT_PREVIEW_SIZE = 2048  # longest edge of the image edits are previewed on
 _STRIP_THREADS = max(1, min(8, (os.cpu_count() or 2)))
 _strip_pool = ThreadPoolExecutor(_STRIP_THREADS, thread_name_prefix="tamis-strip")
@@ -46,15 +49,20 @@ def process_of(path, edit):
     return edit.get("process", develop.PROCESS) if is_raw(path) else develop.PROCESS
 
 
-def _source(path, max_size, process=develop.PROCESS):
-    """(pixels, kind): uint16 linear for RAWs ("raw16", or "linear16" for process 1), uint16 sRGB otherwise ("srgb16")."""
+def _source(path, max_size, process=develop.PROCESS, half=None):
+    """(pixels, kind): uint16 linear for RAWs ("raw16", or "linear16" for process 1), uint16 sRGB otherwise ("srgb16").
+
+    `half(width, height)`, given the RAW's size, says whether developing it at half size is enough
+    (always so with `max_size`).
+    """
     if is_raw(path):
-        options = {"gamma": (1, 1), "output_bps": 16, "use_camera_wb": True, "half_size": max_size is not None}
-        if process >= 2:
-            # A fixed gain (in _linearize) instead of LibRaw's automatic brightness, which clips
-            # the brightest 1% and changes from one photo to the next; clipped channels are blended.
-            options.update(no_auto_bright=True, highlight_mode=rawpy.HighlightMode.Blend)
         with rawpy.imread(path) as raw:
+            options = {"gamma": (1, 1), "output_bps": 16, "use_camera_wb": True}
+            options["half_size"] = max_size is not None or bool(half and half(raw.sizes.width, raw.sizes.height))
+            if process >= 2:
+                # A fixed gain (in _linearize) instead of LibRaw's automatic brightness, which clips
+                # the brightest 1% and changes from one photo to the next; clipped channels are blended.
+                options.update(no_auto_bright=True, highlight_mode=rawpy.HighlightMode.Blend)
             pixels = raw.postprocess(**options)
         return (resize_array(pixels, max_size) if max_size else pixels), ("raw16" if process >= 2 else "linear16")
 
@@ -125,25 +133,37 @@ def straighten_parallel(pixels, degrees):
 
 # -- export --------------------------------------------------------------------
 
-def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=None, long_edge=0):
+def half_size_will_do(width, height, edit, long_edge):
+    """Whether a RAW of that size, developed at half size, still gives `long_edge` once framed by `edit`."""
+    if not long_edge:
+        return False
+    # The sensor's size is before the camera's orientation is applied: try both ways round.
+    return all(
+        max(develop.framed_size(h // 2, w // 2, edit)) >= long_edge for h, w in ((height, width), (width, height))
+    )
+
+
+def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=None, long_edge=0, table=None):
     """Render `path` with `edit` into `dest_dir` as JPEG; returns the new path.
 
     The photo is rendered at full resolution, then scaled down to `long_edge`
-    pixels if that is set and smaller. The JPEG is tagged sRGB (with an ICC
+    pixels if that is set and smaller; a RAW is developed at half size when
+    that still gives `long_edge`. The JPEG is tagged sRGB (with an ICC
     profile) and carries the EXIF of its source, see exif.export_segment().
-    `tables` caches LUT tables between photos of one export (path -> table).
-    With `name` the file is written under that name, replacing one already
-    there; without, it gets a free name (`IMG_1 (1).jpg`).
+    `tables` caches LUT tables between photos of one export (path -> table),
+    or `table` is the LUT's, already built. With `name` the file is written
+    under that name, replacing one already there; without, it gets a free
+    name (`IMG_1 (1).jpg`).
     """
-    table = None
-    if lut_path:
+    if lut_path and table is None:
         if tables is None:
             tables = {}
         if lut_path not in tables:
             tables[lut_path] = lut.build_table(lut.load_grid(lut_path))
         table = tables[lut_path]
 
-    pixels, kind = _source(path, None, process_of(path, edit))
+    half = (lambda width, height: half_size_will_do(width, height, edit, long_edge)) if long_edge else None
+    pixels, kind = _source(path, None, process_of(path, edit), half)
     raw = is_raw(path)
     pixels = develop.turn_array(pixels, edit.get("rotate", 0))
     if edit.get("straighten"):
@@ -270,6 +290,7 @@ class EditRenderer(QObject):
                     image = array_to_image(render_parallel(linear, edit, table, _seed(path), is_raw(path)))
                     error = ""
                 except Exception as exc:  # a bad photo or LUT must not kill the worker
+                    log.exception("Rendering the edit of %s failed", path)
                     image, error = QImage(), str(exc) or type(exc).__name__
                 emit_safely(self._done, generation, path, key + ("#quick" if quick else ""), image, error)
                 with self._lock:
@@ -446,6 +467,7 @@ class EditThumbnails(QObject):
                 try:
                     image = self._render(path, *wanted)
                 except Exception:  # a bad photo or LUT must not kill the worker; it keeps the original's thumbnail
+                    log.exception("Rendering the edited thumbnail of %s failed", path)
                     image = QImage()
                 emit_safely(self._done, generation, path, wanted[0], image)
                 with self._lock:

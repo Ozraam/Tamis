@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 import os
 import time
 from html import escape
@@ -15,6 +16,8 @@ from . import bursts, xmp
 from .constants import KEEP_DIR, LEGACY_GLOBAL_CONFIG_FILENAME, REJECT, REJECT_DIR, SESSION_FILENAME
 from .models import SORT_KEYS, relative_key, save_session
 from .widgets import inform
+
+log = logging.getLogger(__name__)
 
 # Changes in the folder are looked for this long after they happen, so that a burst of files is read once;
 # after the app's own session writes, a while longer.
@@ -268,6 +271,7 @@ class FolderMixin:
         try:
             path = save_session(self.folder, self.model.photos, self.session_fallback_dir, self.moved_keys, problems)
         except OSError as exc:
+            log.warning("Could not save the session of %s: %s", self.folder, exc)
             self._session_problem("failed", f"Could not save marks: {exc.strerror or exc}")
             return
         finally:
@@ -315,6 +319,7 @@ class FolderMixin:
                 xmp.write(photo.files, xmp.REJECTED_RATING if rejected else photo.rating, photo.label, listings[directory])
                 photo.xmp_pending = False
             except OSError as exc:
+                log.warning("Could not write the XMP sidecar of %s: %s", photo.path, exc)
                 photo.xmp_pending = True
                 self.xmp_dirty.add(path)
                 if not self.xmp_warned:

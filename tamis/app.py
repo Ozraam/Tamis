@@ -13,8 +13,9 @@ from PyQt6.QtCore import (
     QStandardPaths,
     Qt,
     QTimer,
+    QUrl,
 )
-from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -28,7 +29,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, bursts, develop, exportsettings, shortcuts, xmp
+from . import __version__, bursts, develop, exportsettings, logs, shortcuts, xmp
 from .analysis import PhotoAnalyzer
 from .constants import (
     APP_NAME,
@@ -334,8 +335,16 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         menu.addAction("Export Settings…", self.edit_export_settings)
         menu.addAction("Keyboard Shortcuts…", self.edit_shortcuts)
         menu.addSeparator()
+        menu.addAction("Show Log File", self.show_log_file)
         menu.addAction(f"About {APP_NAME}…", self.show_about)
         return menu
+
+    def show_log_file(self):
+        """Where warnings, errors and crashes are written, to attach to a bug report."""
+        if logs.path is None or not os.path.exists(logs.path):
+            inform(self, "No log file", "Nothing has been logged since launch, or the log folder can't be written.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(logs.path))
 
     def show_about(self):
         """The app's version, and those of what it is built on, for bug reports."""

@@ -6,6 +6,7 @@ mostly talk to the file operations of `fileops` rather than to the views.
 
 import errno
 import json
+import logging
 import os
 import threading
 from contextlib import suppress
@@ -14,7 +15,7 @@ from html import escape
 from PyQt6.QtCore import QEventLoop, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import QDialog, QProgressDialog
 
-from . import exportsettings
+from . import exportsettings, lut
 from .constants import KEEP, REJECT, REJECT_DIR
 from .editing import export_photo
 from .exportsettings import ExportSettings
@@ -26,6 +27,7 @@ from .fileops import (
     execute_trash,
     export_record,
     find_card,
+    free_name,
     is_jpeg,
     jpeg_file,
     plan_exports,
@@ -39,6 +41,11 @@ from .fileops import (
 )
 from .models import FolderChanges, by_name, relative_key
 from .widgets import ExportSettingsDialog, ImportDialog, MessageDialog, ProcessDialog, inform, size_text
+
+log = logging.getLogger(__name__)
+
+# Photos exported at a time, each rendered in parallel strips too: bounded by memory, a 24 Mpx photo taking about 0.5 GB.
+PARALLEL_EXPORTS = max(1, min(3, (os.cpu_count() or 2) // 3))
 
 
 def _names(paths, limit=5):
@@ -72,27 +79,73 @@ class ExportThread(QThread):
         self._stop.set()
 
     def run(self):
-        tables = {}
-        for done, (path, edit, lut_path, name) in enumerate(self.jobs):
-            if self._stop.is_set():
-                self.stopped = True
-                break
-            self.progressed.emit(done)
-            try:
-                if name is not None and os.path.normcase(os.path.abspath(os.path.join(self.dest_dir, name))) in self.protected:
-                    raise OSError(errno.EEXIST, "a photo has that name in the export folder")
-                if edit or not is_jpeg(path) or self.settings.resizes:
-                    dest = export_photo(
-                        path, edit, lut_path, self.dest_dir, tables,
-                        quality=self.settings.quality, name=name, long_edge=self.settings.long_edge,
-                    )
-                else:
-                    dest = copy_export(path, self.dest_dir, name)
+        """Export PARALLEL_EXPORTS photos at a time: LibRaw develops a RAW mostly on one core."""
+        tables = {}  # LUT path -> table, built once for the whole export
+        results = [None] * len(self.jobs)  # (dest, path) or an error, in the order of the jobs
+        lock = threading.Lock()
+        pending = iter(enumerate(self.jobs))
+        reserved = set()  # free names picked by photos still being rendered
+        done = 0
+
+        def table(lut_path):
+            with lock:
+                if lut_path not in tables:
+                    tables[lut_path] = lut.build_table(lut.load_grid(lut_path))
+                return tables[lut_path]
+
+        def worker():
+            nonlocal done
+            while True:
+                with lock:
+                    if self._stop.is_set():
+                        return
+                    job = next(pending, None)
+                    if job is None:
+                        return
+                    index, (path, edit, lut_path, name) = job
+                    if name is None:  # two photos named alike must not pick the same free name
+                        stem, ext = os.path.splitext(os.path.basename(path))
+                        name = free_name(self.dest_dir, stem, ext if self._copies(job[1]) else ".jpg", reserved)
+                        reserved.add(name)
+                try:
+                    results[index] = (self._export(path, edit, lut_path and table(lut_path), name), path)
+                except Exception as exc:  # one bad photo must not stop the others
+                    log.exception("Exporting %s failed", path)
+                    results[index] = f"{os.path.basename(path)}: {exc}"
+                with lock:
+                    done += 1
+                    self.progressed.emit(done)
+
+        self.progressed.emit(0)
+        threads = [threading.Thread(target=worker, name=f"tamis-export-{n}") for n in range(min(PARALLEL_EXPORTS, len(self.jobs)))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for result in results:
+            if isinstance(result, tuple):
+                dest, path = result
                 self.exported.append(dest)
                 self.sources[dest] = path
-            except Exception as exc:  # one bad photo must not stop the others
-                self.errors.append(f"{os.path.basename(path)}: {exc}")
+            elif result is not None:
+                self.errors.append(result)
+        self.stopped = None in results
         self.progressed.emit(len(self.jobs))
+
+    def _copies(self, job):
+        """Whether `job` copies the photo's JPEG rather than rendering it."""
+        path, edit, _lut_path, _name = job
+        return not (edit or not is_jpeg(path) or self.settings.resizes)
+
+    def _export(self, path, edit, table, name):
+        if name is not None and os.path.normcase(os.path.abspath(os.path.join(self.dest_dir, name))) in self.protected:
+            raise OSError(errno.EEXIST, "a photo has that name in the export folder")
+        if self._copies((path, edit, None, name)):
+            return copy_export(path, self.dest_dir, name)
+        return export_photo(
+            path, edit, None, self.dest_dir, quality=self.settings.quality, name=name,
+            long_edge=self.settings.long_edge, table=table,
+        )
 
 
 class WorkThread(QThread):
@@ -118,6 +171,7 @@ class WorkThread(QThread):
         try:
             self.result = self.work(progress)
         except Exception as exc:  # an exception escaping run() would abort the process
+            log.exception("A long job failed")
             self.failure = str(exc) or type(exc).__name__
 
 
@@ -508,7 +562,8 @@ class ProcessingMixin:
         self.edit_thumbnails.rename_paths(result.moved)
         self.xmp_dirty = {result.moved.get(path, path) for path in self.xmp_dirty}
         self.moved_keys.update(relative_key(self.folder, old) for old in result.moved)
-        self.undo_stack.clear()  # undo entries refer to the old paths
+        # Undo entries name photos by path: they follow them, so a mark can still be undone (the files move on the next run).
+        self.undo_stack = [[(result.moved.get(path, path), name, value) for path, name, value in undo] for undo in self.undo_stack]
         self.save_session()
         self._on_statuses_changed([])
         self.analyzer.restart()  # what was running has the old paths; results are kept by file, so little is lost
