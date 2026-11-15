@@ -177,10 +177,10 @@ def jpeg_file(photo):
     return next(filter(is_jpeg, photo.files), None)
 
 
-def free_name(dest_dir, stem, ext):
-    """`stem + ext`, or `stem (n) + ext` if that is taken in `dest_dir`."""
+def free_name(dest_dir, stem, ext, reserved=()):
+    """`stem + ext`, or `stem (n) + ext` if that is taken in `dest_dir` (or among the names `reserved`)."""
     name, n = stem + ext, 1
-    while os.path.exists(os.path.join(dest_dir, name)):
+    while name in reserved or os.path.exists(os.path.join(dest_dir, name)):
         name, n = f"{stem} ({n}){ext}", n + 1
     return name
 

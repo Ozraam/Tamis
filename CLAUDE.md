@@ -28,7 +28,7 @@ After every code change (features, fixes, refactors), rebuild the app with `./sc
 `TamisApp` (`app.py`) is the coordinator: it owns the model, the background engines and the views, and most features are wired together there. The long jobs on files (exporting, Process Files, importing, the Trash) are `ProcessingMixin` (`processing.py`), part of `TamisApp`, and run behind `run_with_progress`, a modal progress dialog that sets `moving`. Three more mixins split the rest of it by topic: `FolderMixin` (`folders.py`: opening, reading and refreshing the folder, saving the session and sidecars), `NavigationMixin` (`navigation.py`: stepping through photos, "Keeps only", Compare) and `EditingMixin` (`editui.py`: the edit panel, presets, rotation, crop, before/after and `_framed`). They share `TamisApp`'s attributes, set in its `__init__`; `app.py` keeps the UI, showing photos, marking, the Gallery, sorting and analysis. The Cull view and Compare's views are in `views.py`; `widgets.py` has the bars, delegate and dialogs. Plugins reach `TamisApp` attributes through `window` (documented as unstable), so renaming them can break plugins.
 
 ### Photos are identified by path
-`Photo` (`models.py`) holds `status` (the mark), `location` (the folder it is actually in) and `edit`. Moving a file changes its identity, so every path-keyed structure has to follow. After a move, `TamisApp._move_files` (`processing.py`) calls `model.apply_moves`, `loader.rename_paths` and `editor.rename_paths`, and clears the undo stack, whose entries hold old paths. Any new path-keyed cache needs the same treatment.
+`Photo` (`models.py`) holds `status` (the mark), `location` (the folder it is actually in) and `edit`. Moving a file changes its identity, so every path-keyed structure has to follow. After a move, `TamisApp._move_files` (`processing.py`) calls `model.apply_moves`, `loader.rename_paths` and `editor.rename_paths`, and remaps the undo stack, whose entries hold paths. Any new path-keyed cache needs the same treatment.
 
 `Photo.files` is the primary file plus its `companions` (the JPEG of a RAW+JPEG pair). Anything operating on a photo's files must include the companions; `fileops` also moves XMP sidecars and renames a whole group together.
 
@@ -53,7 +53,9 @@ Seven engines follow the same pattern, `FolderScanner` (`scanning.py`, reading f
 ### Edit pipeline
 An edit is a plain dict holding only the non-default settings, as normalised by `develop.clean()`; `{}` means not edited. The same dict is stored in the session file and passed to the renderer.
 
-`develop.render()` takes linear float32 RGB and must stay position-independent: each step may depend only on a pixel and its position in the full image (`origin` / `full_size`), so strip-based export gives the same result as a preview. The framing is applied before `render()` in this order, so vignette and grain follow the final frame: quarter turns (`rotate`), straightening (`straighten`, enlarged to fill the frame, same size), crop (in fractions of the turned picture). When adding a setting, update `DEFAULTS` and `RANGES` in `develop.py` and the panel in `editpanel.py`.
+`develop.render()` works in place on its own copies (never on `linear`) to save memory and time; `scripts/bench_render.py` measures it. It takes linear float32 RGB and must stay position-independent: each step may depend only on a pixel and its position in the full image (`origin` / `full_size`), so strip-based export gives the same result as a preview. The framing is applied before `render()` in this order, so vignette and grain follow the final frame: quarter turns (`rotate`), straightening (`straighten`, enlarged to fill the frame, same size), crop (in fractions of the turned picture). When adding a setting, update `DEFAULTS` and `RANGES` in `develop.py` and the panel in `editpanel.py`.
+
+The edit panel must stay simple for quick edits while culling. What it has today (exposure, white balance, contrast, highlights, shadows, saturation, film simulation, grain, vignette, crop and rotation) is its basic view; every new edit feature (HSL, tone curve, colour grading, clarity, sharpening, noise reduction, lens corrections, local adjustments…) goes in an **Advanced** tab of the panel, not among the basic settings, unless the user asks otherwise. The first such feature creates the tab. The tab says when the photo uses advanced settings (a dot on its title, for example), so no edit is hidden; Reset, copy/paste and presets cover both tabs.
 
 `develop.FRAMING` belongs to one photo: copy, paste and presets carry `develop.look(edit)` over and leave each photo's `develop.framing(edit)` alone. `TamisApp._framed` frames with Qt what the renderer didn't make (the preview before a render, the before view, the 1:1 zoom) and must keep matching the numpy pipeline. Presets (`presets.py`) are stored in `presets.json` in the app's data folder, through `develop.clean()` on load; `TamisApp(presets_file=...)` overrides the file, as the tests' `window` fixture does.
 
@@ -77,6 +79,8 @@ An edit is a plain dict holding only the non-default settings, as normalised by 
 
 `Photo.exports` records what was exported of a photo (name, size, modification time, and `dir`, the export folder as the settings gave it, when it isn't `_EXPORTS`), in the session. `remove_rejected_exports` only deletes files that still match their record, so files the user added or changed in the export folder are safe.
 
+`ExportThread` exports `PARALLEL_EXPORTS` photos at a time (results kept in job order; free names are reserved under a lock so two photos never pick the same one), and `export_photo` develops a RAW at half size when `half_size_will_do` says the framed picture still reaches `long_edge`.
+
 `ExportSettings` (`exportsettings.py`) holds the size, quality, folder and name pattern, in QSettings with the named profiles and the Process Files scope (`export_scope`, "all" but rejects or "keeps"). `ExportSettings.problem` refuses a folder among the photos, since exports replace files of the same name. Rendered exports are tagged sRGB and carry EXIF built by `exif.export_segment` from the source (orientation reset); resizing happens on the assembled output, after `render()`.
 
 ### Version and releases
@@ -97,4 +101,4 @@ An edit is a plain dict holding only the non-default settings, as normalised by 
 
 - Do not use `QMessageBox`: with Qt 6.11 on recent macOS its native `NSAlert` crashes AppKit (`trace trap`). Use `inform` / `MessageDialog` from `widgets.py`.
 - `PyQt6>=6.9` is required for `QSortFilterProxyModel.beginFilterChange()`.
-- `faulthandler` is enabled at startup, so native Qt/LibRaw crashes print a Python traceback.
+- `faulthandler` is enabled at startup and points at the log file (`logs.py`, `~/Library/Logs/Tamis/tamis.log`), so native Qt/LibRaw crashes leave a Python traceback there. Errors caught in workers are logged with `logging.getLogger(__name__)`, since the built app's stderr goes nowhere.

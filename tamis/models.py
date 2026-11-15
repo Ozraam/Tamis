@@ -41,8 +41,11 @@ _FIELD_ROLES = {
     "edit": [EDITED_ROLE, Qt.ItemDataRole.DecorationRole],
 }
 
-# Below this share of the folder's median sharpness, a photo is suggested as soft.
-SOFT_RATIO = 0.4
+# Below this share of the folder's median sharpness, a photo is suggested as soft. Tuned on 7 culled
+# shoots (1,947 photos, scripts/sharpness_report.py): 0.2 flags 3% of the keeps, and 84% of what it
+# flags was rejected; 0.4 flagged 11% of the keeps. Sharp photos with little texture (shallow depth
+# of field, smooth faces, plain backgrounds) score low, which is why it can't be higher.
+SOFT_RATIO = 0.2
 
 
 @dataclass(frozen=True)

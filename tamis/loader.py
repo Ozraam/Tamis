@@ -4,6 +4,7 @@ Workers only decode QImages; results come back to the GUI thread through
 queued signals on this long-lived QObject, where they become QPixmaps.
 Superseded requests are skipped rather than terminated.
 """
+import logging
 import math
 import os
 from collections import OrderedDict
@@ -16,6 +17,8 @@ from .constants import PREVIEW_CACHE_SIZE, PREVIEW_MAX_SIZE, THUMBNAIL_CACHE_BYT
 from .exif import read_info
 from .imaging import load_image
 from .workers import emit_safely
+
+log = logging.getLogger(__name__)
 
 _CANCELLED = "\0cancelled"
 
@@ -46,6 +49,7 @@ def _decode(path, max_size):
         image, native = load_image(path, max_size)
         return image, native, ""
     except Exception as exc:  # decoding must never kill a worker thread
+        log.warning("Could not decode %s: %s", path, exc, exc_info=not isinstance(exc, OSError))
         return QImage(), QSize(), str(exc) or type(exc).__name__
 
 

@@ -1,5 +1,6 @@
 """Reading folders off the GUI thread: a slow disk or share must not freeze the window."""
 
+import logging
 from dataclasses import dataclass, field
 
 from PyQt6.QtCore import QObject, QThreadPool, pyqtSignal
@@ -7,6 +8,8 @@ from PyQt6.QtCore import QObject, QThreadPool, pyqtSignal
 from .analysis import file_key
 from .models import scan_changes, scan_folder
 from .workers import emit_safely
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -98,6 +101,7 @@ class FolderScanner(QObject):
             try:
                 result = work(generation)
             except Exception as exc:  # an unreadable folder must not kill the worker
+                log.warning("Could not read %s: %s", folder, exc, exc_info=not isinstance(exc, OSError))
                 result = ScanResult(folder, error=getattr(exc, "strerror", None) or str(exc) or type(exc).__name__)
             result.request = request
             emit_safely(self._done, generation, result)

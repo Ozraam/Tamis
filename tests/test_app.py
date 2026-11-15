@@ -548,6 +548,17 @@ def test_process_files_can_skip_the_exports(window, tmp_path, monkeypatch):
     assert not (tmp_path / "_EXPORTS").exists()
 
 
+def test_marks_can_still_be_undone_after_process_files(window, tmp_path, monkeypatch):
+    window.go_to(0)
+    press(window, Qt.Key.Key_P)
+    process(window, monkeypatch, export=False)
+    moved = str(tmp_path / "_KEEPS" / "IMG_0.jpg")
+    assert window.model.photo(window.model.row_of(moved)).status == KEEP
+    window.undo()
+    assert window.model.photo(window.model.row_of(moved)).status is None  # the file moves on the next run
+    assert os.path.exists(moved)
+
+
 def test_process_dialog_needs_something_to_do(qapp):
     with_moves = ProcessDialog(None, "1 photo will be moved", "Export 1 photo(s)", "details")
     with_moves.export_check.setChecked(False)
@@ -1176,7 +1187,8 @@ def test_export_errors_are_reported_and_the_others_exported(window, tmp_path, mo
     assert sorted(os.listdir(tmp_path / "_EXPORTS")) == ["IMG_0.jpg", "IMG_1.jpg"]
 
 
-def test_stop_ends_an_export_after_the_photo_being_written(window, tmp_path, monkeypatch):
+def test_stop_ends_an_export_after_the_photos_being_written(window, tmp_path, monkeypatch):
+    monkeypatch.setattr(processing, "PARALLEL_EXPORTS", 2)
     release = threading.Event()
     real_export = processing.export_photo
 
@@ -1198,9 +1210,51 @@ def test_stop_ends_an_export_after_the_photo_being_written(window, tmp_path, mon
 
     window.export_photos()
 
-    assert os.listdir(tmp_path / "_EXPORTS") == ["IMG_0.jpg"]
-    assert window.toast.text() == f"Stopped: exported 1 of {PHOTOS} photo(s) to _EXPORTS"
+    assert sorted(os.listdir(tmp_path / "_EXPORTS")) == ["IMG_0.jpg", "IMG_1.jpg"]  # the two under way
+    assert window.toast.text() == f"Stopped: exported 2 of {PHOTOS} photo(s) to _EXPORTS"
     assert not window.moving
+
+
+def test_photos_are_exported_several_at_a_time(window, tmp_path, monkeypatch):
+    monkeypatch.setattr(processing, "PARALLEL_EXPORTS", 3)
+    running, most = [0], [0]
+    lock = threading.Lock()
+    real_export = processing.export_photo
+
+    def export(*args, **kwargs):
+        with lock:
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+        time.sleep(0.05)
+        try:
+            return real_export(*args, **kwargs)
+        finally:
+            with lock:
+                running[0] -= 1
+
+    monkeypatch.setattr(processing, "export_photo", export)
+    window.model.set_field(list(range(PHOTOS)), "edit", {"contrast": 20})
+    select_in_gallery(window, range(PHOTOS))
+
+    window.export_photos()
+
+    assert most[0] == 3
+    assert sorted(os.listdir(tmp_path / "_EXPORTS")) == [f"IMG_{i}.jpg" for i in range(PHOTOS)]
+    assert window.toast.text() == f"Exported {PHOTOS} photo(s) to _EXPORTS"
+
+
+def test_photos_of_the_same_name_exported_together_get_free_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(processing, "PARALLEL_EXPORTS", 3)
+    for folder in ("a", "b", "c"):
+        (tmp_path / folder).mkdir()
+        image = QImage(30, 20, QImage.Format.Format_RGB32)
+        image.fill(QColor(90, 80, 70))
+        assert image.save(str(tmp_path / folder / "IMG_1.jpg"))
+    jobs = [(str(tmp_path / folder / "IMG_1.jpg"), {"contrast": 10}, None, None) for folder in ("a", "b", "c")]
+    thread = processing.ExportThread(jobs, str(tmp_path / "out"))
+    thread.run()
+    assert thread.errors == []
+    assert [os.path.basename(path) for path in thread.exported] == ["IMG_1.jpg", "IMG_1 (1).jpg", "IMG_1 (2).jpg"]
 
 
 def test_exporting_a_pair_again_gives_free_names(window, tmp_path):
@@ -1477,6 +1531,14 @@ def test_bursts_off_clears_the_groups(window):
 
 
 # -- sharpness -------------------------------------------------------------------
+
+def test_soft_means_below_a_fifth_of_the_median(window):
+    scores = {0: 100.0, 1: 30.0, 2: 15.0, 3: 110.0, 4: 90.0, 5: 105.0}  # median 100
+    for row, score in scores.items():
+        window.model.photo(row).sharpness = score
+    window.model.analysis_changed()
+    assert [window.model.is_soft(row) for row in range(PHOTOS)] == [False, False, True, False, False, False]
+
 
 def test_focus_filter_and_sharpness_sort_follow_the_scores(window):
     scores = {0: 100.0, 1: 5.0, 2: 90.0, 3: 110.0, 4: 80.0, 5: 95.0}
@@ -2238,3 +2300,22 @@ def test_a_slow_folder_says_how_far_its_reading_got(window, tmp_path, monkeypatc
     window.toast.show_message = lambda text, *_args: seen.append(text)
     open_folder(window, str(tmp_path))
     assert f"Reading {tmp_path.name}… {PHOTOS} photo(s)" in seen
+
+
+def test_show_log_file_opens_it(window, tmp_path, monkeypatch):
+    from tamis import app as app_module
+    from tamis import logs
+
+    opened, told = [], []
+    # (QUrl gives / separators on Windows too)
+    monkeypatch.setattr(app_module.QDesktopServices, "openUrl", lambda url: opened.append(os.path.normpath(url.toLocalFile())))
+    monkeypatch.setattr(app_module, "inform", lambda _parent, title, _text, **_kwargs: told.append(title))
+    monkeypatch.setattr(logs, "path", None)
+    window.show_log_file()
+    assert told == ["No log file"] and opened == []
+
+    log_file = tmp_path / "tamis.log"
+    log_file.write_text("")
+    monkeypatch.setattr(logs, "path", str(log_file))
+    window.show_log_file()
+    assert opened == [str(log_file)]

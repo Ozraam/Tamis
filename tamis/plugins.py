@@ -10,6 +10,7 @@ slot would abort the process.
 import copy
 import importlib.util
 import json
+import logging
 import os
 import sys
 import traceback
@@ -22,6 +23,8 @@ from PyQt6.QtWidgets import QMenu
 from . import __version__, develop, xmp
 from .constants import KEEP, REJECT
 from .widgets import inform
+
+log = logging.getLogger(__name__)
 
 EVENTS = frozenset({
     "folder_opened",     # (folder) a folder was opened
@@ -329,7 +332,7 @@ class PluginManager(QObject):
         if problem in plugin.problems:
             return  # a handler failing on every photo is said once
         plugin.problems.append(problem)
-        print(f"Plugin {plugin.id}: {problem}", file=sys.stderr)
+        log.warning("Plugin %s: %s", plugin.id, problem)
         if not self._loading:
             self.window.toast.show_message(toast or f'Plugin "{plugin.name}": {problem}', 5000)
 

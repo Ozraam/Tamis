@@ -7,6 +7,7 @@ modification time, so sorting photos into _KEEPS doesn't lose them.
 """
 import hashlib
 import json
+import logging
 import os
 from contextlib import suppress
 
@@ -18,6 +19,8 @@ from .exif import capture_time
 from .imaging import gray_array, load_image
 from .models import write_json
 from .workers import emit_safely
+
+log = logging.getLogger(__name__)
 
 _TILES = 8  # per side: the score comes from the sharpest tiles, as a subject is often small
 _SHARPEST_TILES = 0.95  # percentile
@@ -57,7 +60,8 @@ def _score(path):
         image, _native = load_image(path, ANALYSIS_MAX_SIZE)
         gray = gray_array(image)
         return {"sharpness": sharpness(gray), "image_hash": difference_hash(gray)}
-    except Exception:  # decoding must never kill a worker thread
+    except Exception as exc:  # decoding must never kill a worker thread
+        log.warning("Could not score %s: %s", path, exc, exc_info=not isinstance(exc, OSError))
         return {}
 
 
@@ -174,6 +178,7 @@ class PhotoAnalyzer(QObject):
             try:
                 results = {"capture_time": capture_time(files)} if kind == "capture" else {"sharpness": None, **_score(path)}
             except Exception:  # a bad photo must not kill a worker
+                log.exception("Analysis of %s failed", path)
                 results = {field: None}
             emit_safely(self._done, generation, (path, kind), key, results)
 
