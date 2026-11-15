@@ -323,7 +323,7 @@ def test_opening_another_folder_while_one_is_read_supersedes_it(window, tmp_path
 
 def test_an_unreadable_folder_is_reported(window, tmp_path, monkeypatch):
     told = []
-    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, text, details=None: told.append((title, text)))
+    monkeypatch.setattr("tamis.folders.inform", lambda _parent, title, text, details=None: told.append((title, text)))
 
     def refuse(*_args):
         raise PermissionError(13, "Permission denied")
@@ -1258,7 +1258,7 @@ def test_photo_taken_out_of_the_folder_gets_its_edit_back(window, tmp_path):
 
 def test_damaged_session_is_reported_once_and_kept(window, tmp_path, monkeypatch):
     shown = []
-    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, _text, details=None: shown.append((title, details)))
+    monkeypatch.setattr("tamis.folders.inform", lambda _parent, title, _text, details=None: shown.append((title, details)))
     (tmp_path / SESSION_FILENAME).write_text("{not json")
 
     open_folder(window, str(tmp_path))
@@ -2002,7 +2002,7 @@ def test_a_preset_that_cannot_be_written_is_reported(window, monkeypatch):
     window.model.set_field([0], "edit", {"contrast": 30})
     name_it(monkeypatch, "A")
     told = []
-    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, _text, **_kwargs: told.append(title))
+    monkeypatch.setattr("tamis.editui.inform", lambda _parent, title, _text, **_kwargs: told.append(title))
     monkeypatch.setattr(window.presets, "save", lambda *_args: (_ for _ in ()).throw(OSError("read-only")))
     window.save_preset()
     assert told == ["Could not save the presets"]

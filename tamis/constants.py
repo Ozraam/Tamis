@@ -71,3 +71,5 @@ LABEL_COLORS = {
     "Blue": "#3b82f6",
     "Purple": "#a855f7",
 }
+
+CULL_TAB, GALLERY_TAB = 0, 1  # the main window's tabs

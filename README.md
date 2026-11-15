@@ -154,7 +154,10 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | --- | --- |
 | `tamis/main.py` | Application entry point |
 | `tamis/migration.py` | Brings over settings and sessions from when the app was called CullSpeed |
-| `tamis/app.py` | Main window: opening folders, navigation, marking, editing, compare |
+| `tamis/app.py` | Main window: its UI, showing photos, marking, the Gallery, sorting and analysis |
+| `tamis/folders.py` | Opening, reading and refreshing the folder, saving its session and sidecars (part of the main window) |
+| `tamis/navigation.py` | Stepping through photos, "Keeps only" and Compare (part of the main window) |
+| `tamis/editui.py` | The edit panel, presets, rotation, crop and before/after (part of the main window) |
 | `tamis/processing.py` | Exporting, Process Files, importing and the Trash, behind a progress dialog (part of the main window) |
 | `tamis/scanning.py` | Reading folders in the background, whole or just what changed |
 | `tamis/workers.py` | Helpers shared by the background engines |
