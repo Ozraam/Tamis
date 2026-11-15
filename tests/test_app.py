@@ -2307,7 +2307,8 @@ def test_show_log_file_opens_it(window, tmp_path, monkeypatch):
     from tamis import logs
 
     opened, told = [], []
-    monkeypatch.setattr(app_module.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
+    # (QUrl gives / separators on Windows too)
+    monkeypatch.setattr(app_module.QDesktopServices, "openUrl", lambda url: opened.append(os.path.normpath(url.toLocalFile())))
     monkeypatch.setattr(app_module, "inform", lambda _parent, title, _text, **_kwargs: told.append(title))
     monkeypatch.setattr(logs, "path", None)
     window.show_log_file()
