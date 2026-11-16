@@ -39,20 +39,38 @@ class EditingMixin:
         """
         return self.edit_panel.isVisible() and is_raw(photo.path)
 
-    def _edited_pixmap(self, photo):
-        """The render of the photo's edit (or of the one being dragged), if it has one, or of its development."""
+    def _rendered_edit(self, photo):
+        """The edit the photo is shown with (the one being dragged, its development…), None if it shows its preview."""
         develops = self._develops(photo)
         edit = self._shown_edit(photo)
         if self.before and not self.cropping:
             if not develops:
                 return None  # the preview any unedited photo shows, which _framed() keeps in its frame
             edit = develop.own(edit)  # the development, framed, without the look
-        live = self.live_edit is not None and self.live_edit[0] == photo.path
         if self.cropping:
             edit = {key: value for key, value in edit.items() if key != "crop"}
         if not edit and not develops:
             return None
+        return edit
+
+    def _edited_pixmap(self, photo):
+        """The render of the photo's edit (or of the one being dragged), if it has one, or of its development."""
+        edit = self._rendered_edit(photo)
+        if edit is None:
+            return None
+        live = self.live_edit is not None and self.live_edit[0] == photo.path
         return self.editor.pixmap(photo.path, edit, self._lut_path(edit), quick=live, same_crop=self.cropping)
+
+    def _edited_full(self, photo):
+        """(pixmap, up to date) of the photo's edit at full resolution, for the 1:1 zoom; (None, True) if it has none.
+
+        While a slider is being dragged, nothing new is rendered: the last one stays up.
+        """
+        edit = self._rendered_edit(photo)
+        if edit is None or self.cropping:
+            return None, True
+        live = self.live_edit is not None and self.live_edit[0] == photo.path
+        return self.editor.full_pixmap(photo.path, edit, self._lut_path(edit), request=not live)
 
     def _framed(self, pixmap, framing):
         """`pixmap` turned, straightened and cropped as `framing` says, like the renderer does it."""

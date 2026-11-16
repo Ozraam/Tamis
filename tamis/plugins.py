@@ -50,12 +50,13 @@ class PhotoInfo:
     rating: int
     label: str | None
     edit: dict
+    metadata: dict = field(default_factory=dict)  # "title", "caption", "keywords", those that are set
 
     @classmethod
     def of(cls, photo):
         return cls(
             photo.path, photo.name, tuple(photo.files), photo.status, photo.location,
-            photo.rating, photo.label, copy.deepcopy(photo.edit),
+            photo.rating, photo.label, copy.deepcopy(photo.edit), copy.deepcopy(photo.metadata),
         )
 
 

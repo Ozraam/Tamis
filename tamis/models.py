@@ -10,7 +10,7 @@ from itertools import groupby
 
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
 
-from . import develop, xmp
+from . import develop, faces, metadata, xmp
 from .constants import (
     KEEP,
     KEEP_DIR,
@@ -33,12 +33,14 @@ SOFT_ROLE = Qt.ItemDataRole.UserRole + 8  # whether the photo looks out of focus
 # Never read: announced with every change a filter depends on, because Qt
 # only re-checks a row when the one role it filters on has changed.
 FILTER_ROLE = Qt.ItemDataRole.UserRole + 9
+FACE_ROLE = Qt.ItemDataRole.UserRole + 10  # "eyes closed", "face soft" or None
 
 _FIELD_ROLES = {
     "status": [STATUS_ROLE, FILTER_ROLE],
     "rating": [RATING_ROLE, FILTER_ROLE],
     "label": [LABEL_ROLE, FILTER_ROLE],
     "edit": [EDITED_ROLE, Qt.ItemDataRole.DecorationRole],
+    "metadata": [Qt.ItemDataRole.ToolTipRole],
 }
 
 # Below this share of the folder's median sharpness, a photo is suggested as soft. Tuned on 7 culled
@@ -70,6 +72,9 @@ class Photo:
     # Quick edits, as develop.clean() keeps them: {} when not edited. Always
     # replaced, never changed in place, so undo can keep the previous one.
     edit: dict = field(default_factory=dict)
+    # Title, caption and keywords, as metadata.clean() keeps them: {} when none.
+    # Replaced, never changed in place, like `edit`.
+    metadata: dict = field(default_factory=dict)
     # The rating and label could not be written to the XMP sidecar yet: until
     # they are, the session has the newer values and wins over the sidecar.
     xmp_pending: bool = False
@@ -80,6 +85,7 @@ class Photo:
     sharpness: float | None = None  # only a suggestion: marks stay the user's
     image_hash: int | None = None  # perceptual hash, see analysis.difference_hash()
     burst: Burst | None = None
+    faces: list | None = None  # [faces.Face], once looked for
 
     @property
     def name(self):
@@ -189,7 +195,7 @@ def _read_saved(folder, groups, listings, fallback_dir, problems, all_names, pro
     for done, (primary, companions, location) in enumerate(groups):
         photo = Photo(primary, location, location, companions=companions)
         photos.append(photo)
-        stored = xmp.read(photo.files, listings[os.path.dirname(primary)])
+        stored = xmp.read_all(photo.files, listings[os.path.dirname(primary)])
         if stored is not None:
             from_sidecars[primary] = stored
         if progress and done % 200 == 0:
@@ -209,11 +215,14 @@ def _read_saved(folder, groups, listings, fallback_dir, problems, all_names, pro
             photo.edit = entry["edit"]
             photo.xmp_pending = entry.get("xmp_pending", False)
             photo.exports = entry.get("exports", [])
+            photo.metadata = entry.get("metadata", {})
         # Sidecars are what other editors change, and Tamis writes them
         # whenever a rating changes: they are the fresher source, unless
         # that write failed.
         if photo.path in from_sidecars and not photo.xmp_pending:
-            rating, photo.label = from_sidecars[photo.path]
+            rating, photo.label, found = from_sidecars[photo.path]
+            if found is not None:  # what another editor wrote there
+                photo.metadata = metadata.clean(found)
             if rating is not None:  # (None: the sidecar says "rejected", which is not a number of stars)
                 photo.rating = rating
     return photos
@@ -329,6 +338,9 @@ def _entry(value):
     exports = _export_records(value.get("exports"))
     if exports:
         entry["exports"] = exports
+    described = metadata.clean(value.get("metadata"))
+    if described:
+        entry["metadata"] = described
     return entry
 
 
@@ -414,7 +426,7 @@ def write_json(path, data):
 
 
 def _session_value(photo):
-    if not photo.rating and photo.label is None and not photo.edit and not photo.xmp_pending and not photo.exports:
+    if not (photo.rating or photo.label is not None or photo.edit or photo.xmp_pending or photo.exports or photo.metadata):
         return photo.status  # same as older sessions
     value = {"status": photo.status, "rating": photo.rating, "label": photo.label}
     if photo.edit:
@@ -423,6 +435,8 @@ def _session_value(photo):
         value["xmp_pending"] = True
     if photo.exports:
         value["exports"] = photo.exports
+    if photo.metadata:
+        value["metadata"] = photo.metadata
     return value
 
 
@@ -440,7 +454,9 @@ def _absent_entries(folder, stored, photos, known, forget):
         if "/" not in key and key in names:
             continue  # a legacy filename key (or a move made elsewhere): that photo has the entry now
         entry = _entry(value)
-        if entry is not None and (entry["status"] or entry["rating"] or entry["label"] or entry["edit"] or "exports" in entry):
+        if entry is not None and (
+            entry["status"] or entry["rating"] or entry["label"] or entry["edit"] or "exports" in entry or "metadata" in entry
+        ):
             kept[key] = value
     return kept
 
@@ -477,7 +493,8 @@ class PhotoModel(QAbstractListModel):
     """Shared by the filmstrip and the gallery."""
 
     statuses_changed = pyqtSignal(list)  # rows whose status, rating, label or edit changed
-    ratings_changed = pyqtSignal(list)  # paths whose rating or label changed
+    ratings_changed = pyqtSignal(list)  # paths whose rating, label or metadata changed
+    metadata_changed = pyqtSignal(list)  # paths whose title, caption or keywords changed
     photos_edited = pyqtSignal(list)  # like statuses_changed, but not when a folder's photos are loaded
     marks_changed = pyqtSignal(list)  # paths whose keep / reject mark changed
 
@@ -490,6 +507,7 @@ class PhotoModel(QAbstractListModel):
         self._keeps = self._rejects = 0
         self.revision = 0  # counts changes of marks, ratings, labels and edits
         self._median_sharpness = None
+        self._median_face_sharpness = None
         self._edit_thumbnails = None  # see set_edit_thumbnails()
         self._lut_path = None
         loader.thumbnail_loaded.connect(self._on_thumbnail_loaded)
@@ -538,6 +556,8 @@ class PhotoModel(QAbstractListModel):
             return photo.burst
         if role == SOFT_ROLE:
             return self.is_soft(index.row())
+        if role == FACE_ROLE:
+            return self.face_issue(index.row())
         return None
 
     @property
@@ -625,11 +645,23 @@ class PhotoModel(QAbstractListModel):
         """Sharpness or bursts changed: repaint, and filter again."""
         scores = sorted(photo.sharpness for photo in self._photos if photo.sharpness is not None)
         self._median_sharpness = scores[len(scores) // 2] if scores else None
+        face_scores = sorted(score for photo in self._photos if (score := faces.face_score(photo.faces)) is not None)
+        self._median_face_sharpness = face_scores[len(face_scores) // 2] if face_scores else None
         if self._photos:
-            self.dataChanged.emit(self.index(0), self.index(len(self._photos) - 1), [BURST_ROLE, SOFT_ROLE, FILTER_ROLE])
+            roles = [BURST_ROLE, SOFT_ROLE, FACE_ROLE, FILTER_ROLE]
+            self.dataChanged.emit(self.index(0), self.index(len(self._photos) - 1), roles)
 
     def median_sharpness(self):
         return self._median_sharpness
+
+    def face_issue(self, row):
+        """"eyes closed", "face soft" or None: a suggestion from the photo's faces, None until they are known."""
+        found = self._photos[row].faces
+        if faces.eyes_closed(found):
+            return "eyes closed"
+        if faces.is_soft(found, self._median_face_sharpness):
+            return "face soft"
+        return None
 
     def is_soft(self, row):
         """Whether this photo is far less sharp than the folder's median: a suggestion, False until known."""
@@ -637,7 +669,7 @@ class PhotoModel(QAbstractListModel):
         return score is not None and self._median_sharpness is not None and score < self._median_sharpness * SOFT_RATIO
 
     def set_field(self, rows, name, value):
-        """Set `name` ("status", "rating", "label" or "edit") on `rows`; returns undo changes."""
+        """Set `name` ("status", "rating", "label", "edit" or "metadata") on `rows`; returns undo changes."""
         return self.set_values(name, {row: value for row in rows})
 
     def set_values(self, name, values):
@@ -709,9 +741,12 @@ class PhotoModel(QAbstractListModel):
                 run = [row for _, row in run]
                 self.dataChanged.emit(self.index(run[0]), self.index(run[-1]), _FIELD_ROLES[name])
         self.statuses_changed.emit(sorted({self.row_of(path) for path, _, _ in changes}))
-        rated = [path for path, name, _ in changes if name in ("rating", "label")]
+        rated = [path for path, name, _ in changes if name in ("rating", "label", "metadata")]
         if rated:
             self.ratings_changed.emit(list(dict.fromkeys(rated)))
+        described = [path for path, name, _ in changes if name == "metadata"]
+        if described:
+            self.metadata_changed.emit(list(dict.fromkeys(described)))
         marked = [path for path, name, _ in changes if name == "status"]
         if marked:
             self.marks_changed.emit(list(dict.fromkeys(marked)))
@@ -731,6 +766,7 @@ class StatusFilterProxy(QSortFilterProxyModel):
     UNMARKED = "unmarked"
     SHARP = "sharp"
     SOFT = "soft"
+    FACES = "faces"  # eyes closed or face soft
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -771,5 +807,7 @@ class StatusFilterProxy(QSortFilterProxyModel):
             return False
         if self._focus == self.ALL:
             return True
+        if self._focus == self.FACES:
+            return model.face_issue(source_row) is not None
         soft = model.is_soft(source_row)
         return soft if self._focus == self.SOFT else not soft

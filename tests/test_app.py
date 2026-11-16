@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer  # noqa: E402
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, QSize, Qt, QTimer  # noqa: E402
 from PyQt6.QtGui import QColor, QImage, QKeySequence, QPixmap  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog, QProgressDialog, QPushButton  # noqa: E402
@@ -51,6 +51,7 @@ def window(qapp, tmp_path, tmp_path_factory):
         plugins_dir=str(tmp_path_factory.mktemp("plugins")),
         cache_dir=str(tmp_path_factory.mktemp("cache")),
         presets_file=str(tmp_path_factory.mktemp("presets") / "presets.json"),
+        check_updates=False,  # never asks GitHub
     )
     win.settings.clear()
     win.resize(1200, 800)
@@ -2273,7 +2274,12 @@ def test_the_raw_note_is_only_for_raws(window):
 
 def test_about_shows_the_version(window, monkeypatch):
     shown = []
-    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, text, details=None: shown.append((title, text)))
+
+    def show(dialog):
+        shown.append((dialog.windowTitle(), dialog.body.text()))
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr("tamis.app.AboutDialog.exec", show)
     about = [action for action in window.options_button.menu().actions() if action.text() == "About Tamis…"]
     about[0].trigger()
     assert shown and shown[0][0] == "Tamis"
@@ -2319,3 +2325,316 @@ def test_show_log_file_opens_it(window, tmp_path, monkeypatch):
     monkeypatch.setattr(logs, "path", str(log_file))
     window.show_log_file()
     assert opened == [str(log_file)]
+
+
+def test_keeps_list_copies_the_names_of_the_keeps(window, monkeypatch):
+    statuses(window, keep=[1, 4], reject=[2])
+    seen = []
+
+    def accept(dialog):
+        seen.append(dialog.preview.toPlainText())
+        dialog.accept()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr("tamis.app.KeepsListDialog.exec", accept)
+    window.show_keeps_list()
+    assert seen == ["IMG_1 IMG_4"]
+    assert QApplication.clipboard().text() == "IMG_1 IMG_4"
+
+
+def test_keeps_list_can_list_what_the_gallery_shows_and_save_it(window, tmp_path, monkeypatch):
+    from tamis.widgets import KeepsListDialog
+
+    statuses(window, reject=[0, 3])
+    window.proxy.set_filter(REJECT)
+    target = tmp_path / "list.txt"
+    monkeypatch.setattr("tamis.widgets.QFileDialog.getSaveFileName", lambda *_args: (str(target), ""))
+
+    def save(dialog):
+        dialog.which_combo.setCurrentIndex(1)
+        dialog.format_combo.setCurrentIndex(dialog.format_combo.findData("lines"))
+        dialog.save_button.click()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(KeepsListDialog, "exec", save)
+    window.show_keeps_list()
+    assert target.read_text() == "IMG_0.jpg\nIMG_3.jpg\n"
+
+
+def fake_github(window, monkeypatch, body):
+    asked = []
+
+    def get(url, done):
+        asked.append(url)
+        done(body)
+
+    monkeypatch.setattr(window.updates, "_get", get)
+    monkeypatch.setattr(window.updates, "current_version", "0.1.0")
+    return asked
+
+
+def release_answer(tag="v0.2.0"):
+    return json.dumps({"tag_name": tag, "html_url": f"https://github.com/Ozraam/Tamis/releases/tag/{tag}"}).encode()
+
+
+def test_a_newer_version_shows_a_toast_once(window, monkeypatch):
+    fake_github(window, monkeypatch, release_answer())
+    shown = []
+    monkeypatch.setattr(window.toast, "show_message", lambda text, *args, **kwargs: shown.append((text, kwargs.get("on_click"))))
+    window.check_for_updates()
+    assert shown and shown[0][0].startswith("Tamis 0.2.0 is available")
+    opened = []
+    monkeypatch.setattr("tamis.app.QDesktopServices.openUrl", lambda url: opened.append(url.toString()))
+    shown[0][1]()
+    assert opened == ["https://github.com/Ozraam/Tamis/releases/tag/v0.2.0"]
+    assert window.settings.value("update_checked_at", 0.0, type=float) > 0
+
+    window.check_for_updates()  # dismissed: not shown again, but About still says it
+    assert len(shown) == 1
+    assert window.available_update.version == "0.2.0"
+
+
+def test_offline_says_nothing_unless_asked(window, monkeypatch):
+    fake_github(window, monkeypatch, None)
+    shown = []
+    monkeypatch.setattr(window.toast, "show_message", lambda text, *args, **kwargs: shown.append(text))
+    window.check_for_updates()
+    assert shown == []
+    assert window.settings.value("update_checked_at", 0.0, type=float) == 0  # tried again next launch
+    window.check_for_updates(manual=True)
+    assert shown == ["GitHub could not be reached."]
+
+
+def test_about_checks_for_updates_now(window, monkeypatch):
+    from tamis.widgets import AboutDialog
+
+    asked = fake_github(window, monkeypatch, release_answer("v0.1.0"))
+    texts = []
+
+    def check(dialog):
+        dialog.check_button.click()
+        texts.append(dialog.update_label.text())
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(AboutDialog, "exec", check)
+    window.show_about()
+    assert asked and texts == ["Tamis 0.1.0 is the latest version."]
+
+
+def test_automatic_checks_follow_the_option_and_wait_a_day(window, monkeypatch):
+    monkeypatch.setattr(window.updates, "current_version", "0.1.0")
+    assert window._update_check_due()
+    window.settings.setValue("update_checked_at", time.time())
+    assert not window._update_check_due()
+    window.settings.setValue("update_checked_at", time.time() - 2 * 24 * 3600)
+    assert window._update_check_due()
+    window.update_check_action.setChecked(False)
+    assert not window._update_check_due()
+
+
+def test_process_files_exports_16_bit_tiffs(window, tmp_path, monkeypatch):
+    window.export_settings = ExportSettings(format="tiff16")
+    statuses(window, keep=[0, 1])
+    window.model.set_field([1], "edit", {"exposure": 0.5})
+    process_with_scope(window, monkeypatch, "keeps")
+    exports = tmp_path / "_EXPORTS"
+    assert sorted(os.listdir(exports)) == ["IMG_0.tif", "IMG_1.tif"]  # the unedited JPEG is rendered too
+    image = QImage(str(exports / "IMG_0.tif"))
+    assert image.depth() == 64 and (image.width(), image.height()) == (300, 200)
+
+
+def test_export_shortcut_writes_png_with_a_watermark(window, tmp_path):
+    window.export_settings = ExportSettings(format="png", watermark_text="© Tamis", watermark_position="top_left",
+                                            watermark_opacity=100, watermark_size=50)
+    window.export_photos()
+    image = QImage(str(tmp_path / "_EXPORTS" / "IMG_0.png"))
+    assert not image.isNull()
+    corner = [image.pixelColor(x, y).lightness() for x in range(0, 150, 3) for y in range(0, 40, 3)]
+    assert max(corner) > 200  # white text on the dark first photo
+    assert image.pixelColor(290, 190).lightness() < 100
+
+
+def test_a_missing_watermark_logo_fails_every_photo_and_says_so(window, tmp_path, monkeypatch):
+    told = []
+    monkeypatch.setattr("tamis.processing.inform", lambda _parent, title, _text, details=None: told.append((title, details)))
+    window.export_settings = ExportSettings(watermark_image=str(tmp_path / "gone.png"))
+    window.export_photos()
+    assert told and told[0][0] == "Some photos were not exported" and "can't be read" in told[0][1][0]
+    assert not (tmp_path / "_EXPORTS").exists() or not os.listdir(tmp_path / "_EXPORTS")
+
+
+def test_copied_jpegs_carry_the_credits_and_the_photo_s_words(window, tmp_path, monkeypatch):
+    from tamis import metadata
+    from tamis.widgets import MetadataDialog
+
+    def describe(dialog):
+        dialog.title_edit.setText("Vows")
+        dialog.keywords_edit.setText("rings, Paris")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(MetadataDialog, "exec", describe)
+    press(window, Qt.Key.Key_K, CTRL)
+    assert window.model.photo(0).metadata == {"title": "Vows", "keywords": ["rings", "Paris"]}
+    window.export_settings = ExportSettings(creator="Ana", copyright="© Ana", keywords="wedding")
+    window.export_photos()
+    data = (tmp_path / "_EXPORTS" / "IMG_0.jpg").read_bytes()
+    xmp_text, datasets = metadata.read_jpeg(data)
+    assert "Vows" in xmp_text and "© Ana" in xmp_text
+    assert [value for record, number, value in datasets if (record, number) == (2, 25)] == [b"rings", b"Paris", b"wedding"]
+    assert QImage.fromData(data).pixelColor(5, 5) == QImage(str(tmp_path / "IMG_0.jpg")).pixelColor(5, 5)  # not re-encoded
+
+    window.undo()
+    assert window.model.photo(0).metadata == {}
+
+
+def test_titles_go_to_the_session_and_the_sidecar_of_a_raw(window, tmp_path, monkeypatch):
+    write_dng(str(tmp_path / "RAW_1.dng"))
+    open_folder(window, str(tmp_path), select="RAW_1.dng")
+    from tamis.widgets import MetadataDialog
+
+    monkeypatch.setattr(MetadataDialog, "exec", lambda dialog: (dialog.caption_edit.setPlainText("At noon"),
+                                                                QDialog.DialogCode.Accepted)[1])
+    window.edit_metadata()
+    window.save_session()
+    assert xmp.parse_metadata((tmp_path / "RAW_1.xmp").read_text()) == {"caption": "At noon"}
+    session = json.loads((tmp_path / SESSION_FILENAME).read_text())
+    assert session["RAW_1.dng"]["metadata"] == {"caption": "At noon"}
+
+
+def test_metadata_of_several_photos_keeps_what_differs(window, monkeypatch):
+    from tamis.widgets import MetadataDialog
+
+    window.model.set_field([1], "metadata", {"title": "A", "caption": "same"})
+    window.model.set_field([2], "metadata", {"title": "B", "caption": "same"})
+    window.tabs.setCurrentIndex(GALLERY_TAB)
+    selection = window.grid.selectionModel()
+    selection.clearSelection()
+    for row in (1, 2):
+        selection.select(window.proxy.index(row, 0), selection.SelectionFlag.Select)
+
+    def add_keywords(dialog):
+        assert dialog.title_edit.text() == "" and dialog.caption_edit.toPlainText() == "same"
+        dialog.keywords_edit.setText("k")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(MetadataDialog, "exec", add_keywords)
+    window.edit_metadata()
+    assert [window.model.photo(row).metadata for row in (1, 2)] == [
+        {"title": "A", "caption": "same", "keywords": ["k"]}, {"title": "B", "caption": "same", "keywords": ["k"]},
+    ]
+
+
+def test_the_1_1_zoom_shows_the_edit_at_full_resolution(window, tmp_path):
+    window.model.set_field([2], "edit", {"exposure": 2.0, "crop": [0, 0, 0.5, 1]})
+    window.go_to(2)
+    original = QImage(str(tmp_path / "IMG_2.jpg")).pixelColor(10, 10).lightness()
+    window.toggle_zoom()
+    view = window.image_view
+    assert wait_until(lambda: not view._full_loading and view._pixmap is not None and view._pixmap.width() == 150)
+    shown = view._pixmap.toImage()
+    assert shown.height() == 200  # cropped, at the photo's own size
+    assert shown.pixelColor(10, 10).lightness() > original + 30  # the edit, not the original
+
+    # A new edit is rendered again; the last render stays up meanwhile.
+    window.model.set_field([2], "edit", {"exposure": -2.0, "crop": [0, 0, 0.5, 1]})
+    window._refresh_view()
+    assert wait_until(lambda: not view._full_loading and view._pixmap.toImage().pixelColor(10, 10).lightness() < original)
+
+
+def test_the_full_resolution_render_is_only_asked_for_while_zoomed(window):
+    window.model.set_field([1], "edit", {"exposure": 1.0})
+    window.go_to(1)
+    assert window.editor._full_wanted == {} and window.editor._full_renders == {}
+
+
+def a_face(x, y, eyes=0.3, sharpness=100.0):
+    from tamis.faces import Face
+
+    return Face((x - 0.1, y - 0.1, 0.2, 0.2), eyes, sharpness)
+
+
+def test_zoom_on_faces_centres_each_photo_on_its_own(window, monkeypatch):
+    monkeypatch.setattr("tamis.faces.available", lambda: True)
+    window.model.photo(0).faces = [a_face(0.3, 0.4)]
+    window.model.photo(1).faces = [a_face(0.6, 0.5), a_face(0.2, 0.2)]
+    window.go_to(0)
+    window.toggle_compare()
+    assert window.compare_rows == [0, 1]
+    press(window, Qt.Key.Key_Z, Qt.KeyboardModifier.ShiftModifier)
+    first, second = window.compare_view.views
+    assert window.compare_view.zoomed
+    assert (first._center.x(), first._center.y()) == pytest.approx((0.3, 0.4))
+    assert (second._center.x(), second._center.y()) == pytest.approx((0.6, 0.5))  # the first, larger face
+
+    # Panning one moves the others by as much.
+    first._center = QPointF(0.35, 0.4)
+    first.view_changed.emit(True, first._center)
+    assert (second._center.x(), second._center.y()) == pytest.approx((0.65, 0.5))
+
+
+def test_zoom_on_faces_waits_for_them_and_skips_photos_without(window, monkeypatch):
+    from tamis.faces import Face
+
+    monkeypatch.setattr("tamis.faces.available", lambda: True)
+    asked = []
+    monkeypatch.setattr(window.analyzer, "request", lambda capture=(), images=(), faces=(): asked.extend(faces))
+    window.go_to(2)
+    window.zoom_to_faces()
+    assert [photo.path for photo in asked] == [window.model.photo(2).path] and not window.image_view.zoomed
+
+    window._on_analyzed(window.model.photo(2).path, {"faces": [Face((0.7, 0.1, 0.2, 0.2)).to_json()]})
+    assert window.image_view.zoomed
+    assert (window.image_view._center.x(), window.image_view._center.y()) == pytest.approx((0.8, 0.2))
+
+    window.image_view.reset_zoom()
+    window.go_to(3)
+    window.model.photo(3).faces = []
+    seen = []
+    monkeypatch.setattr(window.toast, "show_message", lambda text, *args, **kwargs: seen.append(text))
+    window.zoom_to_faces()
+    assert seen == ["No face found"] and not window.image_view.zoomed
+
+
+def test_closed_eyes_and_soft_faces_are_suggested_and_filtered(window):
+    from tamis.models import FACE_ROLE, StatusFilterProxy
+
+    for row in range(PHOTOS):
+        window.model.photo(row).faces = [a_face(0.5, 0.5, sharpness=100.0)]
+    window.model.photo(1).faces = [a_face(0.5, 0.5, eyes=0.05)]
+    window.model.photo(4).faces = [a_face(0.5, 0.5, sharpness=5.0)]
+    window._show_analysis()
+    assert [window.model.index(row).data(FACE_ROLE) for row in range(PHOTOS)] == [
+        None, "eyes closed", None, None, "face soft", None,
+    ]
+    window.gallery_toolbar.set_faces(True)
+    window.gallery_toolbar.focus_combo.setCurrentIndex(window.gallery_toolbar.focus_combo.findData(StatusFilterProxy.FACES))
+    assert window.proxy.rowCount() == 2
+    window.go_to(1)
+    assert "1 face · eyes closed" in window._info_lines(window.model.photo(1))
+
+
+def test_exports_can_carry_a_hidden_mark(window, tmp_path, monkeypatch):
+    image = QImage(400, 300, QImage.Format.Format_RGB32)
+    for y in range(300):
+        for x in range(0, 400, 7):
+            image.setPixelColor(x, y, QColor((x * 3 + y) % 256, (y * 2) % 256, 120))
+    assert image.save(str(tmp_path / "IMG_0.jpg"), "JPG", 95)
+    refresh(window)
+    window.go_to(0)
+    window.export_settings = ExportSettings(hidden_mark="© Ana")
+    window.export_photos()
+    exported = str(tmp_path / "_EXPORTS" / "IMG_0.jpg")
+    told = []
+    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, text, details=None: told.append((title, text)))
+    window.read_hidden_mark(exported)
+    window.read_hidden_mark(str(tmp_path / "IMG_1.jpg"))
+    assert told[0] == ("Hidden mark", "IMG_0.jpg carries: <b>© Ana</b>")
+    assert told[1][0] == "No hidden mark"
+
+
+def test_a_hidden_mark_too_long_is_refused_in_the_dialog(window):
+    dialog = ExportSettingsDialog(window, ExportSettings(), {}, window.folder)
+    dialog.hidden_mark.setText("x" * 40)
+    assert not dialog.confirm_button.isEnabled()
+    dialog.hidden_mark.setText("© Ana")
+    assert dialog.confirm_button.isEnabled() and dialog.settings.hidden_mark == "© Ana"

@@ -65,6 +65,15 @@ def _score(path):
         return {}
 
 
+def faces_from_json(value):
+    """Photo.faces from what the cache keeps (see faces.Face.to_json()); None if unknown."""
+    if value is None:
+        return None
+    from .faces import faces_from_json as convert  # (faces imports this module)
+
+    return convert(value)
+
+
 def file_key(path):
     """What a result is valid for, None if the file can't be read."""
     try:
@@ -124,6 +133,7 @@ class PhotoAnalyzer(QObject):
             photo.capture_time = known.get("capture_time")
             photo.sharpness = known.get("sharpness")
             photo.image_hash = known.get("image_hash")
+            photo.faces = faces_from_json(known.get("faces"))
 
     def save(self):
         """Write what is known to disk. Results of failures aren't kept, so they are tried again next time."""
@@ -153,12 +163,15 @@ class PhotoAnalyzer(QObject):
         self.restart()
         self._pool.waitForDone()
 
-    def request(self, capture=(), images=()):
-        """Queue the capture time of the photos in `capture` and the scores of those in `images`, unless already tried."""
+    def request(self, capture=(), images=(), faces=()):
+        """Queue the capture time of the photos in `capture`, the scores of those in `images`
+        and the faces of those in `faces`, unless already tried."""
         for photo in capture:
             self._queue(photo, "capture", "capture_time", 1)
         for photo in images:
             self._queue(photo, "image", "sharpness", 0)
+        for photo in faces:
+            self._queue(photo, "faces", "faces", -1)  # last: the slowest, and only a suggestion
         if self._pending:
             self.progressed.emit(self._completed, self._total)
 
@@ -176,7 +189,14 @@ class PhotoAnalyzer(QObject):
             if generation != self._generation:
                 return
             try:
-                results = {"capture_time": capture_time(files)} if kind == "capture" else {"sharpness": None, **_score(path)}
+                if kind == "capture":
+                    results = {"capture_time": capture_time(files)}
+                elif kind == "faces":
+                    from . import faces  # (which imports this module)
+
+                    results = faces.analyze(path)
+                else:
+                    results = {"sharpness": None, **_score(path)}
             except Exception:  # a bad photo must not kill a worker
                 log.exception("Analysis of %s failed", path)
                 results = {field: None}

@@ -54,6 +54,7 @@ class ImageView(QWidget):
         self._info = []
         self._active = False
         self._full_loading = False
+        self._full_loading_text = ""
         self._zoomed = False
         self._center = QPointF(0.5, 0.5)  # zoom focus, relative to the image
         self._drag_from = None
@@ -105,9 +106,10 @@ class ImageView(QWidget):
             self._note = text
             self.update()
 
-    def set_full_loading(self, loading):
-        if loading != self._full_loading:
+    def set_full_loading(self, loading, text="Loading full resolution…"):
+        if loading != self._full_loading or text != self._full_loading_text:
             self._full_loading = loading
+            self._full_loading_text = text
             self.update()
 
     def set_status(self, status):
@@ -271,6 +273,19 @@ class ImageView(QWidget):
         if self._zoomed:
             self.toggle_zoom()
 
+    def zoom_to(self, center):
+        """Zoom 1:1 on `center` (fractions of the photo), as if the user had."""
+        if self._pixmap is None:
+            return
+        was_zoomed = self._zoomed
+        self._zoomed = True
+        self._center = QPointF(center)
+        self._update_cursor()
+        self.update()
+        if not was_zoomed:
+            self.zoom_changed.emit(True)
+        self.view_changed.emit(True, self._center)
+
     def set_view(self, zoomed, center):
         """Follow another view's zoom and pan (Compare), without emitting signals."""
         self._zoomed = zoomed
@@ -408,7 +423,7 @@ class ImageView(QWidget):
         if self._note:
             self._draw_note(painter, self._note)
         elif self._zoomed and self._full_loading:
-            self._draw_note(painter, "Loading full resolution…")
+            self._draw_note(painter, self._full_loading_text)
         self._draw_active(painter)
 
     def _draw_overlays(self, painter, target):
@@ -494,7 +509,11 @@ class ImageView(QWidget):
 
 
 class CompareView(QWidget):
-    """Two to four photos side by side; zoom and pan are shared between them."""
+    """Two to four photos side by side; zoom and pan are shared between them.
+
+    After zoom_to(), each photo keeps its own centre (its subject's face) and
+    panning moves them all by as much.
+    """
 
     activated = pyqtSignal(int)  # index of the view the user clicked
     zoom_changed = pyqtSignal(bool)
@@ -503,6 +522,7 @@ class CompareView(QWidget):
         super().__init__(parent)
         self._views = []
         self._zoomed = False
+        self._offsets = {}  # view -> its centre minus the shared one, after zoom_to()
         self._layout = QGridLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(2)
@@ -531,21 +551,37 @@ class CompareView(QWidget):
         for i, view in enumerate(self._views):
             self._layout.addWidget(view, i // columns, i % columns)
         self._zoomed = False
+        self._offsets = {}
         for view in self._views:
             view.set_view(False, QPointF(0.5, 0.5))
 
     def toggle_zoom(self, index):
+        self._offsets = {}
         self._views[index].toggle_zoom()
 
     def reset_zoom(self):
+        self._offsets = {}
         for view in self._views:
             view.set_view(False, QPointF(0.5, 0.5))
         self._set_zoomed(False)
 
+    def zoom_to(self, centers):
+        """Zoom 1:1 with each view on its own centre (None: the shared one, the middle)."""
+        middle = QPointF(0.5, 0.5)
+        self._offsets = {view: (center - middle if center is not None else QPointF()) for view, center in zip(
+            self._views, centers, strict=False)}
+        for view in self._views:
+            view.set_view(True, middle + self._offsets.get(view, QPointF()))
+        self._set_zoomed(True)
+
     def _sync(self, source, zoomed, center):
+        if not zoomed:
+            self._offsets = {}
+        shared = center - self._offsets.get(source, QPointF())
         for view in self._views:
             if view is not source:
-                view.set_view(zoomed, center)
+                moved = shared + self._offsets.get(view, QPointF())
+                view.set_view(zoomed, QPointF(min(1.0, max(0.0, moved.x())), min(1.0, max(0.0, moved.y()))))
         self._set_zoomed(zoomed)
 
     def _set_zoomed(self, zoomed):

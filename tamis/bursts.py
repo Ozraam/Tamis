@@ -1,4 +1,5 @@
-"""Grouping shots taken in quick succession. Only reads capture times, sharpness and hashes off photos."""
+"""Grouping shots taken in quick succession. Only reads capture times, sharpness, hashes and faces off photos."""
+from . import faces
 from .constants import BURST_GAP_SECONDS
 from .models import Burst
 
@@ -24,12 +25,25 @@ def groups(photos, gap=BURST_GAP_SECONDS):
     return [run for run in runs if len(run) >= 2]
 
 
+def best_frame(run):
+    """The frame of a burst to suggest, None until at least two are scored.
+
+    Where faces are known, the one whose faces are sharpest among those where
+    nobody blinks; otherwise the sharpest frame.
+    """
+    with_faces = [photo for photo in run if faces.face_score(getattr(photo, "faces", None)) is not None]
+    if len(with_faces) >= 2:
+        open_eyes = [photo for photo in with_faces if not faces.eyes_closed(photo.faces)] or with_faces
+        return max(open_eyes, key=lambda photo: faces.face_score(photo.faces))
+    scored = [photo for photo in run if photo.sharpness is not None]
+    return max(scored, key=lambda photo: photo.sharpness) if len(scored) >= 2 else None
+
+
 def assign(photos, gap=BURST_GAP_SECONDS):
-    """Set each photo's `burst`, marking the sharpest frame of each once at least two are scored."""
+    """Set each photo's `burst`, marking the best frame of each (see best_frame())."""
     for photo in photos:
         photo.burst = None
     for burst_id, run in enumerate(groups(photos, gap)):
-        scored = [photo for photo in run if photo.sharpness is not None]
-        sharpest = max(scored, key=lambda photo: photo.sharpness) if len(scored) >= 2 else None
+        sharpest = best_frame(run)
         for position, photo in enumerate(run):
             photo.burst = Burst(burst_id, position, len(run), photo is sharpest)

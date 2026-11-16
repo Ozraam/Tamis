@@ -12,6 +12,8 @@ dependencies = [
     "PyQt6>=6.9,<7",  # 6.9: QSortFilterProxyModel.beginFilterChange()
     "rawpy>=0.21,<1",
     "numpy>=1.24,<3",
+    # Closed eyes and soft faces (faces.py), with Apple's Vision: macOS only, optional at run time.
+    "pyobjc-framework-Vision>=10; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

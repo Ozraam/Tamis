@@ -58,6 +58,7 @@ def _timed_window(app, folder):
         plugins_dir=os.path.join(scratch, "plugins"),
         cache_dir=os.path.join(scratch, "cache"),
         presets_file=os.path.join(scratch, "presets.json"),
+        check_updates=False,
     )
 
     def shown(path):

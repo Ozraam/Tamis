@@ -101,6 +101,7 @@ class FolderMixin:
             bursts.assign(photos)
         photos.sort(key=SORT_KEYS[self.sort_order])
         self.xmp_dirty = {photo.path for photo in photos if photo.xmp_pending}  # try those again
+        self.xmp_metadata_dirty = set(self.xmp_dirty)  # (their session has the newer metadata too)
         if self.xmp_marks == "rating":
             self.xmp_dirty |= {photo.path for photo in photos if photo.status == REJECT}
         self._end_compare(show=False)
@@ -195,6 +196,7 @@ class FolderMixin:
                 self.editor.forget(path)
                 self.edit_thumbnails.forget(path)
             self.xmp_dirty -= gone
+            self.xmp_metadata_dirty -= gone
             self.undo_stack = [kept for undo in self.undo_stack if (kept := [c for c in undo if c[0] not in gone])]
             if set(compared) & gone:
                 self._end_compare(show=False)
@@ -202,6 +204,8 @@ class FolderMixin:
         for photo in changes.added:
             if photo.xmp_pending or (self.xmp_marks == "rating" and photo.status == REJECT):
                 self.xmp_dirty.add(photo.path)
+            if photo.xmp_pending:
+                self.xmp_metadata_dirty.add(photo.path)
 
         self.model.update_photos(changes, SORT_KEYS[self.sort_order])
         self.compare_rows = [self.model.row_of(path) for path in compared]
@@ -316,7 +320,11 @@ class FolderMixin:
                 if directory not in listings:
                     listings[directory] = {name.lower(): name for name in os.listdir(directory)}
                 rejected = self.xmp_marks == "rating" and photo.status == REJECT
-                xmp.write(photo.files, xmp.REJECTED_RATING if rejected else photo.rating, photo.label, listings[directory])
+                described = photo.metadata if path in self.xmp_metadata_dirty else None  # only when changed here
+                xmp.write(
+                    photo.files, xmp.REJECTED_RATING if rejected else photo.rating, photo.label, listings[directory], described
+                )
+                self.xmp_metadata_dirty.discard(path)
                 photo.xmp_pending = False
             except OSError as exc:
                 log.warning("Could not write the XMP sidecar of %s: %s", photo.path, exc)

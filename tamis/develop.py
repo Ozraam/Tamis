@@ -291,8 +291,8 @@ def _grain(shape, origin, full_width, amount, size, seed):
     return noise[row_offset:row_offset + height, col_offset:col_offset + width] * (amount / 100 * 0.12)
 
 
-def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=False):
-    """Apply `edit` to `linear` (float32, h×w×3); returns sRGB uint8 h×w×3.
+def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=False, bits=8):
+    """Apply `edit` to `linear` (float32, h×w×3); returns sRGB uint8 h×w×3 (uint16 with `bits` 16).
 
     `raw` says that `linear` is a RAW's development, which process 2 rolls off
     in the highlights. `table` is the film simulation LUT from lut.build_table() (None: no LUT).
@@ -361,7 +361,7 @@ def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=
         out += (noise * (0.35 + 2.6 * luma * (1 - luma)))[..., None]  # strongest in the midtones
 
     np.clip(out, 0.0, 1.0, out=out)
-    return _to_uint8(out)
+    return _to_uint16(out) if bits == 16 else _to_uint8(out)
 
 
 def _encode_in_place(linear):
@@ -369,6 +369,13 @@ def _encode_in_place(linear):
     np.clip(linear, 0.0, 1.0, out=linear)
     linear *= _ENCODE_STEPS
     return _ENCODE[linear.astype(np.uint16)]
+
+
+def _to_uint16(values):
+    """[0, 1] floats -> uint16, rounded; overwrites `values` on the way."""
+    values *= 65535
+    values += 0.5
+    return values.astype(np.uint16)
 
 
 def _to_uint8(values):
