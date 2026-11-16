@@ -83,3 +83,59 @@ def test_read_says_a_rejected_rating_is_no_number_of_stars(tmp_path):
 
     xmp.write([raw], 2, "Red", names(tmp_path))
     assert xmp.read([raw], names(tmp_path)) == (2, "Red")
+
+
+LIGHTROOM_WORDS = """<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:lr="http://ns.adobe.com/lightroom/1.0/"
+   xmp:Rating="2">
+   <dc:title>
+    <rdf:Alt>
+     <rdf:li xml:lang="fr">Les vœux</rdf:li>
+     <rdf:li xml:lang="x-default">Vows &amp; rings</rdf:li>
+    </rdf:Alt>
+   </dc:title>
+   <dc:subject>
+    <rdf:Bag>
+     <rdf:li>wedding</rdf:li>
+     <rdf:li>Paris</rdf:li>
+    </rdf:Bag>
+   </dc:subject>
+   <lr:hierarchicalSubject><rdf:Bag><rdf:li>Places|Paris</rdf:li></rdf:Bag></lr:hierarchicalSubject>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"""
+
+
+def test_titles_and_keywords_are_read_from_lightroom():
+    assert xmp.parse_metadata(LIGHTROOM_WORDS) == {"title": "Vows & rings", "keywords": ["wedding", "Paris"]}
+    assert xmp.parse_metadata(LIGHTROOM) is None
+
+
+def test_updating_titles_and_keywords_keeps_everything_else():
+    text = xmp.update_metadata(LIGHTROOM_WORDS, {"title": "Rings", "caption": "At noon", "keywords": ["Paris"]})
+    assert xmp.parse_metadata(text) == {"title": "Rings", "caption": "At noon", "keywords": ["Paris"]}
+    assert "lr:hierarchicalSubject" in text and 'xmp:Rating="2"' in text
+    assert text.count("xmlns:dc=") == 1 and text.count("<dc:title>") == 1
+    assert xmp.parse_metadata(xmp.update_metadata(text, {})) is None
+
+
+def test_metadata_goes_into_a_self_closing_description():
+    text = xmp.update_metadata('<rdf:RDF><rdf:Description rdf:about=""/></rdf:RDF>', {"caption": "<Hi>"})
+    assert 'xmlns:dc="http://purl.org/dc/elements/1.1/"' in text
+    assert xmp.parse_metadata(text) == {"caption": "<Hi>"}
+    assert xmp.parse(xmp.update(text, 3, None)) == (3, None)
+
+
+def test_write_and_read_back_metadata(tmp_path):
+    raw = str(tmp_path / "IMG.CR2")
+    open(raw, "w").close()
+    xmp.write([raw], 0, None, names(tmp_path), {"keywords": ["a", "b"]})
+    assert xmp.read_all([raw], names(tmp_path)) == (0, None, {"keywords": ["a", "b"]})
+    xmp.write([raw], 4, None, names(tmp_path))  # None: left alone
+    assert xmp.read_all([raw], names(tmp_path)) == (4, None, {"keywords": ["a", "b"]})
+    assert xmp.read([raw], names(tmp_path)) == (4, None)

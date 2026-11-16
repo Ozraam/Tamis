@@ -553,3 +553,21 @@ def test_entries_of_absent_photos_are_upgraded_too(tmp_path):
     write_session(tmp_path, {"gone.NEF": {"status": KEEP, "edit": {"contrast": 20}}})
     save_session(str(tmp_path), scan_folder(str(tmp_path)))
     assert stored(tmp_path)["gone.NEF"]["edit"] == {"contrast": 20, "process": 1}
+
+
+def test_titles_and_keywords_are_saved_and_a_sidecar_s_win(tmp_path):
+    touch(tmp_path / "IMG_1.jpg")
+    touch(tmp_path / "IMG_2.CR2")
+    photos = scan_folder(str(tmp_path))
+    photos[0].metadata = {"title": "One"}
+    photos[1].metadata = {"keywords": ["two"]}
+    save_session(str(tmp_path), photos)
+    assert stored(tmp_path)["IMG_1.jpg"]["metadata"] == {"title": "One"}
+    (tmp_path / "IMG_2.xmp").write_text(
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:subject><rdf:Bag><rdf:li>from Lightroom</rdf:li></rdf:Bag></dc:subject>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>"
+    )
+    again = scan_folder(str(tmp_path))
+    assert [photo.metadata for photo in again] == [{"title": "One"}, {"keywords": ["from Lightroom"]}]

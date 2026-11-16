@@ -178,8 +178,20 @@ def gray_array(image):
 
 
 def array_to_image(array):
-    """uint8 h×w×3 (or h×w) array -> QImage that owns its pixels."""
+    """uint8 h×w×3 (or h×w) array -> QImage that owns its pixels; a uint16 h×w×3 one gives a 16-bit QImage."""
+    if array.dtype == np.uint16:
+        return _from_array16(array)
     return _from_array(array)
+
+
+def _from_array16(array):
+    height, width = array.shape[:2]
+    rgbx = np.empty((height, width, 4), dtype=np.uint16)
+    rgbx[..., :3] = array
+    rgbx[..., 3] = 65535
+    data = rgbx.tobytes()
+    del rgbx
+    return QImage(data, width, height, width * 8, QImage.Format.Format_RGBX64).copy()
 
 
 def resize_array(array, max_size):

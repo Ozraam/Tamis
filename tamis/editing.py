@@ -24,7 +24,7 @@ import rawpy
 from PyQt6.QtCore import QBuffer, QIODevice, QObject, Qt, QThread, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QColorSpace, QImage, QImageReader, QPixmap
 
-from . import develop, exif, lut
+from . import develop, exif, exportsettings, lut, metadata, stego, watermark
 from .constants import THUMBNAIL_CACHE_BYTES, is_raw
 from .fileops import atomic_write, free_name
 from .imaging import array_to_image, image_to_array, resize_array, to_srgb
@@ -131,7 +131,61 @@ def straighten_parallel(pixels, degrees):
     return np.concatenate(list(parts))
 
 
+# -- full resolution -------------------------------------------------------------
+
+def _framed(pixels, edit):
+    """`pixels` (a full-size source) turned, straightened and cropped as `edit` says."""
+    pixels = develop.turn_array(pixels, edit.get("rotate", 0))
+    if edit.get("straighten"):
+        pixels = straighten_parallel(pixels, edit["straighten"])
+    return develop.crop_array(pixels, edit.get("crop"))
+
+
+def render_full(pixels, kind, edit, table, seed, raw, bits=8):
+    """develop.render() of the framed source `pixels` (as _source() gives them), in strips that bound memory.
+
+    Returns uint8 (or uint16 with `bits` 16) h×w×3.
+    """
+    height, width = pixels.shape[:2]
+    out = np.empty((height, width, 3), dtype=np.uint16 if bits == 16 else np.uint8)
+    strip = 240 * _STRIP_THREADS  # sequential chunks bound memory; each is rendered in parallel
+    for top in range(0, height, strip):
+        block = _linearize(pixels[top:top + strip], kind)
+        rows = block.shape[0]
+        parts = _strip_pool.map(
+            lambda y, block=block, top=top: develop.render(
+                block[y:y + 240], edit, table, seed, (top + y, 0), (height, width), raw, bits
+            ),
+            range(0, rows, 240),
+        )
+        out[top:top + rows] = np.concatenate(list(parts))
+    return out
+
+
 # -- export --------------------------------------------------------------------
+
+def with_hidden_mark(image, text, bits=8):
+    """`image` with `text` hidden in its pixels (stego.py), as a new QImage of `bits` per channel.
+
+    Unchanged if the picture is too small to hold it.
+    """
+    pixels = image_to_array(image).astype(np.float64) / 257
+    if not stego.embed(pixels, text):
+        log.warning("The hidden mark doesn't fit in a %d×%d export", image.width(), image.height())
+        return image
+    if bits == 16:
+        return array_to_image(np.round(pixels * 257).astype(np.uint16))
+    return array_to_image(np.round(pixels).astype(np.uint8))
+
+
+def read_hidden_mark(path):
+    """The text hidden in an image file, None if there is none (or it can't be read)."""
+    image = QImageReader(path)
+    image.setAutoTransform(False)  # the blocks line up with the pixels as written
+    decoded = image.read()
+    if decoded.isNull():
+        return None
+    return stego.read(image_to_array(decoded).astype(np.float64) / 257)
 
 def half_size_will_do(width, height, edit, long_edge):
     """Whether a RAW of that size, developed at half size, still gives `long_edge` once framed by `edit`."""
@@ -143,18 +197,28 @@ def half_size_will_do(width, height, edit, long_edge):
     )
 
 
-def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=None, long_edge=0, table=None):
-    """Render `path` with `edit` into `dest_dir` as JPEG; returns the new path.
+def export_photo(
+    path, edit, lut_path, dest_dir, tables=None, quality=92, name=None, long_edge=0, table=None,
+    settings=None, logo=None, photo_metadata=None,
+):
+    """Render `path` with `edit` into `dest_dir` (JPEG unless `settings` say otherwise); returns the new path.
 
     The photo is rendered at full resolution, then scaled down to `long_edge`
     pixels if that is set and smaller; a RAW is developed at half size when
-    that still gives `long_edge`. The JPEG is tagged sRGB (with an ICC
-    profile) and carries the EXIF of its source, see exif.export_segment().
+    that still gives `long_edge`. `settings` (an ExportSettings) give the
+    format, size, quality and watermark instead of `quality` and `long_edge`;
+    `logo` is the watermark's, already loaded. Every format is tagged sRGB (with
+    an ICC profile); a JPEG also carries the EXIF of its source (see
+    exif.export_segment()) and the credits of `settings` with the photo's
+    title, caption and keywords, `photo_metadata` (see metadata.py). A 16-bit format is rendered at 16 bits.
     `tables` caches LUT tables between photos of one export (path -> table),
     or `table` is the LUT's, already built. With `name` the file is written
     under that name, replacing one already there; without, it gets a free
     name (`IMG_1 (1).jpg`).
     """
+    if settings is not None:
+        quality, long_edge = settings.quality, settings.long_edge
+    fmt = settings.file_format if settings is not None else exportsettings.FORMATS_BY_ID["jpeg"]
     if lut_path and table is None:
         if tables is None:
             tables = {}
@@ -164,31 +228,13 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
 
     half = (lambda width, height: half_size_will_do(width, height, edit, long_edge)) if long_edge else None
     pixels, kind = _source(path, None, process_of(path, edit), half)
-    raw = is_raw(path)
-    pixels = develop.turn_array(pixels, edit.get("rotate", 0))
-    if edit.get("straighten"):
-        pixels = straighten_parallel(pixels, edit["straighten"])
-    pixels = develop.crop_array(pixels, edit.get("crop"))
-    height, width = pixels.shape[:2]
-    out = np.empty((height, width, 3), dtype=np.uint8)
-    seed = _seed(path)
-    strip = 240 * _STRIP_THREADS  # sequential chunks bound memory; each is rendered in parallel
-    for top in range(0, height, strip):
-        block = _linearize(pixels[top:top + strip], kind)
-        rows = block.shape[0]
-        steps = range(0, rows, 240)
-        parts = _strip_pool.map(
-            lambda y, block=block, top=top: develop.render(
-                block[y:y + 240], edit, table, seed, (top + y, 0), (height, width), raw
-            ),
-            steps,
-        )
-        out[top:top + rows] = np.concatenate(list(parts))
+    out = render_full(_framed(pixels, edit), kind, edit, table, _seed(path), is_raw(path), fmt.bits)
     del pixels
+    height, width = out.shape[:2]
 
     os.makedirs(dest_dir, exist_ok=True)
     if name is None:
-        name = free_name(dest_dir, os.path.splitext(os.path.basename(path))[0], ".jpg")
+        name = free_name(dest_dir, os.path.splitext(os.path.basename(path))[0], fmt.extension)
     dest = os.path.join(dest_dir, name)
     image = array_to_image(out)
     del out
@@ -196,12 +242,19 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
         image = image.scaled(
             long_edge, long_edge, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
         )
+    if settings is not None and settings.watermarks:
+        image = watermark.apply(image, settings, logo)
+    if settings is not None and settings.hidden_mark:
+        image = with_hidden_mark(image, settings.hidden_mark, fmt.bits)
     image.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))  # written as an ICC profile
     buffer = QBuffer()
     buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-    if not image.save(buffer, "JPG", quality):
+    if not image.save(buffer, fmt.writer.upper(), quality if fmt.quality else -1):
         raise EditError(f"could not write {name}")
-    data = exif.with_exif(bytes(buffer.data()), exif.export_segment(path, (image.width(), image.height())))
+    data = bytes(buffer.data())
+    if fmt.id == "jpeg":
+        data = exif.with_exif(data, exif.export_segment(path, (image.width(), image.height())))
+        data = metadata.with_metadata(data, metadata.for_export(settings, photo_metadata))
     with atomic_write(dest) as tmp_path, open(tmp_path, "wb") as file:
         file.write(data)
     return dest
@@ -210,17 +263,24 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
 # -- live previews ---------------------------------------------------------------
 
 class EditRenderer(QObject):
-    """Renders edited previews in the background; results arrive as `rendered(path)`."""
+    """Renders edited previews in the background; results arrive as `rendered(path)`.
+
+    Full-resolution renders, for the 1:1 zoom, run on a thread of their own so
+    that previews never wait for them; they arrive as `rendered(path)` too.
+    """
 
     rendered = pyqtSignal(str)
     failed = pyqtSignal(str, str)
 
     _done = pyqtSignal(int, str, str, QImage, str)  # generation, path, key, image, error
+    _full_done = pyqtSignal(int, str, str, QImage, str)
 
     BASES = 4  # developed photos kept (≈ 33 MB each at EDIT_PREVIEW_SIZE)
     TABLES = 2  # LUT tables kept (48 MB each)
     RENDERS = 8
     TURNED = 2  # turned or straightened photos kept, so that a slider doesn't turn them again each time
+    FULL_SOURCES = 1  # full-size developments kept (≈ 150 MB for 24 Mpx), so that a new edit is only rendered
+    FULL_RENDERS = 2  # full-resolution renders kept (≈ 70 MB each for 24 Mpx)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -236,6 +296,14 @@ class EditRenderer(QObject):
         self._renders = OrderedDict()  # path -> (key, quick, QPixmap); GUI thread only
         self._errors = {}  # path -> key that failed; GUI thread only
         self._done.connect(self._on_done)
+        self._full_pool = QThreadPool(self)
+        self._full_pool.setMaxThreadCount(1)
+        self._full_sources = OrderedDict()  # (path, process) -> (pixels, kind), full size
+        self._full_wanted = {}  # path -> (key, edit, lut path): the newest request
+        self._full_running = set()
+        self._full_renders = OrderedDict()  # path -> (key, QPixmap); GUI thread only
+        self._full_errors = {}  # path -> key that failed; GUI thread only
+        self._full_done.connect(self._on_full_done)
 
     @staticmethod
     def _key(edit, lut_path):
@@ -257,6 +325,90 @@ class EditRenderer(QObject):
         if current is None or (same_crop and develop.framing(json.loads(current[0])[0]) != develop.framing(edit)):
             return None
         return current[2]
+
+    def full_pixmap(self, path, edit, lut_path, request=True):
+        """(pixmap, up to date): the full-resolution render of `edit`, for the 1:1 zoom.
+
+        While it is being made, the latest one framed the same way is given
+        (not up to date), or None. Without `request` (a slider being dragged),
+        nothing new is rendered.
+        """
+        key = self._key(edit, lut_path)
+        current = self._full_renders.get(path)
+        if current is not None and current[0] == key:
+            self._full_renders.move_to_end(path)
+            return current[1], True
+        if request and self._full_errors.get(path) != key:
+            with self._lock:
+                self._full_wanted[path] = (key, edit, lut_path)
+                start = path not in self._full_running
+                self._full_running.add(path)
+            if start:
+                self._full_pool.start(self._full_job(path, self._generation))
+        if current is not None and develop.framing(json.loads(current[0])[0]) == develop.framing(edit):
+            return current[1], False
+        return None, False
+
+    def keep_full_requests(self, paths):
+        """Drop the full-resolution requests of photos other than `paths`: no longer zoomed into."""
+        with self._lock:
+            for path in [path for path in self._full_wanted if path not in paths]:
+                del self._full_wanted[path]
+
+    def _full_job(self, path, generation):
+        def job():
+            while True:
+                with self._lock:
+                    wanted = self._full_wanted.get(path)
+                    if wanted is None or generation != self._generation:
+                        self._full_running.discard(path)
+                        return
+                key, edit, lut_path = wanted
+                try:
+                    process = process_of(path, edit)
+                    pixels, kind = self._full_source(path, process)
+                    table = self.table(lut_path) if lut_path else None
+                    out = render_full(_framed(pixels, edit), kind, edit, table, _seed(path), is_raw(path))
+                    image, error = array_to_image(out), ""
+                    del out
+                except Exception as exc:  # a bad photo or LUT must not kill the worker
+                    log.exception("Rendering the edit of %s at full resolution failed", path)
+                    image, error = QImage(), str(exc) or type(exc).__name__
+                emit_safely(self._full_done, generation, path, key, image, error)
+                with self._lock:
+                    if self._full_wanted.get(path) == wanted:
+                        del self._full_wanted[path]
+                        self._full_running.discard(path)
+                        return
+
+        return job
+
+    def _full_source(self, path, process):
+        key = (path, process)
+        with self._lock:
+            if key in self._full_sources:
+                return self._full_sources[key]
+            self._full_sources.clear()  # before developing another: they are big
+        source = _source(path, None, process)
+        with self._lock:
+            self._full_sources[key] = source
+            while len(self._full_sources) > self.FULL_SOURCES:
+                self._full_sources.popitem(last=False)
+        return source
+
+    def _on_full_done(self, generation, path, key, image, error):
+        if generation != self._generation:
+            return
+        if error:
+            self._full_errors[path] = key
+            self.failed.emit(path, error)
+            return
+        self._full_errors.pop(path, None)
+        self._full_renders[path] = (key, QPixmap.fromImage(image))
+        self._full_renders.move_to_end(path)
+        while len(self._full_renders) > self.FULL_RENDERS:
+            self._full_renders.popitem(last=False)
+        self.rendered.emit(path)
 
     def keep_requests(self, paths):
         """Drop the requests not rendered yet of photos other than `paths`: they are no longer shown."""
@@ -366,14 +518,15 @@ class EditRenderer(QObject):
 
     def forget(self, path):
         """Drop the render of `path` (its edit was removed)."""
-        self._renders.pop(path, None)
-        self._errors.pop(path, None)
+        for cache in (self._renders, self._errors, self._full_renders, self._full_errors):
+            cache.pop(path, None)
 
     def rename_paths(self, mapping):
         with self._lock:
             _rename_keys(self._bases, mapping)
+            _rename_keys(self._full_sources, mapping)
             self._turned.clear()
-        for cache in (self._renders, self._errors):
+        for cache in (self._renders, self._errors, self._full_renders, self._full_errors):
             for old, new in mapping.items():
                 if old in cache:
                     cache[new] = cache.pop(old)
@@ -381,17 +534,22 @@ class EditRenderer(QObject):
     def reset(self):
         self._generation += 1
         self._pool.clear()
+        self._full_pool.clear()
         with self._lock:
             self._wanted.clear()
             self._running.clear()
             self._bases.clear()
             self._turned.clear()
-        self._renders.clear()
-        self._errors.clear()
+            self._full_wanted.clear()
+            self._full_running.clear()
+            self._full_sources.clear()
+        for cache in (self._renders, self._errors, self._full_renders, self._full_errors):
+            cache.clear()
 
     def shutdown(self):
         self.reset()
         self._pool.waitForDone()
+        self._full_pool.waitForDone()
 
 
 def _rename_keys(cache, mapping):

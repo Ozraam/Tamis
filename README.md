@@ -4,19 +4,23 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 
 ## Features
 - Supports JPEG, PNG, WebP, TIFF, HEIC (when Qt has a plugin for it) and common RAW formats (ARW, CR2, CR3, NEF, DNG, ORF, RAF, RW2) via `rawpy`.
-- **Cull** view: the current photo fitted to the window with a filmstrip; next/previous photos are prefetched so stepping through is instant. Double-click or `Z` zooms to 1:1 (the photo is loaded at full resolution for focus checking), drag to pan. The zoom and its position stay as you move to the next photo, so a burst can be checked at the same spot.
+- **Cull** view: the current photo fitted to the window with a filmstrip; next/previous photos are prefetched so stepping through is instant. Double-click or `Z` zooms to 1:1 (the photo is loaded at full resolution for focus checking), drag to pan. The zoom and its position stay as you move to the next photo, so a burst can be checked at the same spot. An edited photo shows its edit at 1:1 too, rendered at full resolution in the background (the original shows in its frame until then), so grain or a film simulation can be checked up close.
+- **Zoom on faces** (`⇧Z`, in the Cull view and Compare): zooms each photo to 1:1 on its own main face, at the same scale, since the subject moves a little between the frames of a burst; panning then moves them all by as much. A photo without a face keeps the shared zoom. Needs face detection (macOS, below).
 - **Keeps only**: `K` (or the chip in the Cull tab's corner) limits the filmstrip and all navigation to the photos marked keep, for a second pass. Rejecting or unmarking a photo moves on to the next keep; picking another photo in the Gallery, or `N`, ends the filter.
 - **Compare**: `C` shows photos side by side (the current and next one, or the 2–4 selected in the Gallery) with shared zoom and pan. `←`/`→` pick the photo that marks apply to.
 - **Gallery** view: thumbnail grid with multi-select marking and adjustable thumbnail size. Filters combine: status (All / Unmarked / Keeps / Rejects), minimum stars, colour labels (several can be on) and focus, and follow changes live.
 - **Sorting**: by name, with numbers compared as numbers (`IMG_9` before `IMG_10`), by capture date (with sub-seconds; a file without a date uses its modification time) or by sharpness. The choice is remembered, and dates are read in the background, so the order changes once they are all known.
 - **Bursts** (`B`, or the chip in the Gallery): shots less than 2 seconds apart are grouped in the filmstrip and Gallery with a coloured bar and their place in the burst (`2/5`), unless the picture changes completely. `⇧P` keeps the current photo and rejects the rest of its burst, as one undo step.
 - **Sharpness**, computed in the background when something needs it (the sort, the focus filter, bursts): the variance of the Laplacian in the sharpest regions of a photo. It is only a suggestion: `◎` marks the sharpest frame of a burst and `soft` a photo below a fifth of the folder's median, and marks stay yours. Scores are compared within a folder. On seven culled shoots, `soft` flagged 3% of the photos kept, and 84% of what it flagged had been rejected; in bursts, the frame kept was usually the sharpest or nearly. Sharp photos with little fine detail (shallow depth of field, smooth faces, plain or dark backgrounds) score low, so a `soft` photo is worth a look before rejecting it.
+- **Closed eyes and soft faces** (macOS, off by default: **Options ▾ > Look for Closed Eyes and Soft Faces**): Apple's Vision framework finds faces in the background (on the Neural Engine, no model shipped), measures how open the eyes are and scores the sharpness of the faces alone, since a sharp background can hide a soft face. Thumbnails say `eyes closed` or `face soft` (a face below 30% of the folder's median face sharpness; a group is as sharp as its softest face, and faces far smaller than the largest are ignored), the info overlay too, and the Gallery's focus filter gets **Eyes closed or face soft**. In a burst, `◎` then goes to the frame with the sharpest faces where nobody blinks. Only suggestions, remembered per file like the other scores; the threshold is a first guess, not tuned on real shoots yet. Elsewhere, or without `pyobjc-framework-Vision` (installed with Tamis on macOS), the option isn't shown.
 - **Focus peaking** (`F` in the Cull view): highlights the sharp edges of what is shown, edits, crop and 1:1 zoom included.
 - **Import** (`⌘I`): finds the photos in the sub-folders of a memory card, copies them with their sidecars to a folder and optionally to a backup, reads every copy back to compare it with the original, then opens the folder. Nothing on the card changes, files never overwrite others (`IMG_1 (1).CR2`), and those already imported are skipped, even if sorted into `_KEEPS` or `_REJECTS` since.
 - **Trash Rejects**: moves the photos in `_REJECTS` that are still marked reject to the system Trash, with their pairs and sidecars, after a confirmation with their count and size. Nothing is ever deleted: a photo that can't go to the Trash stays where it is, whole.
 - Thumbnails are kept on disk (up to 512 MB, in the app's cache folder), so reopening a folder is fast. They are found by a file's path, size and modification time, so a changed or moved file just gets a new one.
 - **Edited thumbnails**: the filmstrip and the Gallery show photos with their edit and frame, rendered in the background at low priority and kept on disk per edit; until then they show the original.
 - **Star ratings and colour labels**, written to XMP sidecars (`xmp:Rating`, `xmp:Label`) so Lightroom, Bridge, Capture One and darktable see them. Existing sidecars are edited in place, touching only those two properties; new ones are only created for RAWs (`IMG.xmp`).
+- **Title, caption and keywords** (`⌘K`, on the current or selected photos): written to the XMP sidecar (`dc:title`, `dc:description`, `dc:subject`, which Lightroom shows as Title, Caption and Keywords; only those properties are touched) and the session, and into exports. A sidecar's own values win, as for ratings; with several photos, a field that differs between them is left alone unless you type in it. Undoable.
+- **List of keeps for other editors** (**Options ▾ > List of Keeps for Other Editors…**): the names of the keeps, or of the photos the Gallery shows, to copy or save: for Lightroom Classic's Library filter (**Text › Filename › Contains**, names without extension separated by spaces, so a RAW and its JPEG both match), one file name per line (Capture One, Photo Mechanic…) or a CSV with marks, stars and labels.
 - **Keep and reject in other editors**, off by default (**Options ▾ > Show Keep and Reject in Other Editors**), as no flag is common to them. *Rejected as rating −1* writes the `xmp:Rating="-1"` that darktable and Bridge read as rejected; the photo keeps its stars in Tamis, but other editors no longer see them. *Keep green, reject red* gives photos those colour labels, for editors that read `xmp:Label` such as Lightroom, whose own flags are not in XMP at all. A label you gave a photo yourself stays, except that unmarking clears a green or red one. As with ratings, new sidecars are only created for RAWs.
 - **RAW+JPEG pairs** (same name, same folder) are culled as one photo and always move together.
 - **Shooting info** (exposure, aperture, ISO, focal length, camera, lens, date) read from EXIF; `I` shows or hides it.
@@ -30,15 +34,16 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - Undo for every marking, rating and labelling action.
 - Marks are saved automatically in `tamis_session.json` inside each photo folder.
 - **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). Unless you untick the export box in its confirmation (ticked by default), it then fills the export folder (`_EXPORTS` unless the export settings say otherwise): edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied. The confirmation lets you choose what is exported: *everything except rejects* (the default) or *keeps only*, remembered for next time. Earlier exports of the same photos are replaced, so processing again refreshes them, and exports of photos rejected since are removed, from whichever folder they were written to (Tamis remembers what it exported: other files there, and exports changed since, stay). The confirmation lists the photos without a JPEG, which are not exported (`⌘⇧E` renders them), and those whose film simulation is no longer in the LUT folder, which would be exported without it. A photo whose files can't all be moved stays where it is, with its pair and sidecars, and exports are written to a temporary file first, so a failure never leaves a truncated JPEG behind. Marks made before can still be undone: the photo then moves on the next Process Files.
-- **Export settings** (**Options ▾ > Export Settings…**, or the button in the Process Files confirmation): the longest edge (full size by default), the JPEG quality (92), the folder (relative to the shoot folder, such as `_EXPORTS` or `web/large`, or a full path; never the shoot folder itself, `_KEEPS` or `_REJECTS`) and a name pattern made of `{name}` (the original name), `{date}` (capture date, `YYYY-MM-DD`), `{seq}` (`001`, `002`… in the order of one export) and `{folder}` (the shoot folder's name). Save them as named profiles (web, client, print…) to switch between them. Rendered exports are tagged sRGB, with an ICC profile, and carry the EXIF of their original (camera, lens, date, exposure, copyright, GPS), with the orientation reset since their pixels are upright. Unedited JPEGs are copied as they are, unless they have to be resized. Several photos are exported at a time, and a RAW is developed at half its size when that still gives the long edge asked for, which makes small exports much faster.
+- **Export settings** (**Options ▾ > Export Settings…**, or the button in the Process Files confirmation): the format (JPEG; 16-bit TIFF, rendered from the 16-bit development before quantisation, for printing or retouching; PNG; HEIF, AVIF and WebP where Qt can write them), the longest edge (full size by default), the quality (92, for JPEG, HEIF, AVIF and WebP), the folder (relative to the shoot folder, such as `_EXPORTS` or `web/large`, or a full path; never the shoot folder itself, `_KEEPS` or `_REJECTS`) and a name pattern made of `{name}` (the original name), `{date}` (capture date, `YYYY-MM-DD`), `{seq}` (`001`, `002`… in the order of one export) and `{folder}` (the shoot folder's name). Save them as named profiles (web, client, print…) to switch between them. Rendered exports are tagged sRGB, with an ICC profile; JPEGs also carry the EXIF of their original (camera, lens, date, exposure, copyright, GPS), with the orientation reset since their pixels are upright. Unedited JPEGs are copied as they are, unless they have to be resized, watermarked or turned into another format. The **Watermark** tab adds a line of text or a PNG logo, in a corner or the centre, sized and placed in percent of the long edge, with an opacity: it is painted after resizing, so it looks the same on any export. A **Hidden mark** (up to 32 bytes of text, such as your name) can be written invisibly into the pixels instead or as well: each 8×8 block carries a bit, changing pixels by less than a level on average, and it survives saving as JPEG down to quality 60, but not resizing, cropping or rotating. **Options ▾ > Read a Hidden Mark…** reads it from a file. The **Credits** tab holds the creator, copyright, contact (e-mail or website) and default keywords, written with each photo's title, caption and keywords into JPEG exports, copied ones included (their pixels untouched), as XMP and as IPTC-IIM for older software; any XMP or IPTC the original had is replaced. Several photos are exported at a time, and a RAW is developed at half its size when that still gives the long edge asked for, which makes small exports much faster.
 - Reopens the last folder and photo on launch. Drop a folder onto the window to open it.
-- **Options ▾ > About Tamis…** shows the version, and those of Python, Qt and LibRaw, for bug reports.
+- **Options ▾ > About Tamis…** shows the version, and those of Python, Qt and LibRaw, for bug reports, and whether a newer version is out (**Check for Updates Now**).
+- **New versions**: at launch, at most once a day, Tamis asks GitHub for its latest release (`api.github.com/repos/Ozraam/Tamis/releases/latest`, in the background, sending nothing but a generic `User-Agent: Tamis/<version>`). If it is newer, a message says so once (click it to open the release page), and About keeps saying it. Pre-releases are ignored, nothing is said when offline, and **Options ▾ > Check for Updates Automatically** turns it off.
 - **Options ▾ > Show Log File** opens the log, where warnings, errors (photos that can't be read, failed exports and XMP writes, plugin errors) and the traceback of a crash are written: `~/Library/Logs/Tamis/tamis.log` on macOS, a `logs` folder in the app's data folder elsewhere. Attach it to a bug report.
 - **Plugins**: add your own actions and shortcuts with a small Python file (see [Plugins](#plugins)).
 
 ## Requirements
 - Python 3.10+
-- PyQt6 (6.9+), rawpy and numpy, installed from `pyproject.toml`
+- PyQt6 (6.9+), rawpy and numpy, installed from `pyproject.toml`; on macOS also `pyobjc-framework-Vision`, for faces
 
 ### Platforms
 macOS is the supported platform: it is what Tamis is used and built on, and the only one with a ready-made app (see [Releases](#releases)). CI also runs the tests on Linux and Windows, from source (`python -m tamis`), so that the app keeps working there, but they get less use; reports are welcome. On Windows, a read-only folder can't be simulated in the tests, so falling back to the app's data folder for marks isn't tested there.
@@ -66,6 +71,7 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Next unmarked photo | `N` |
 | Keeps only in the Cull view, on / off | `K` |
 | Zoom 1:1 / back to fit | `Z` or double-click / `Esc` |
+| Zoom 1:1 on each photo's main face (macOS) | `⇧Z` / `Shift+Z` |
 | Compare (current + next, or the Gallery selection) / leave | `C` / `C` or `Esc` |
 | Show / hide shooting info | `I` |
 | Edit panel | `E` |
@@ -73,8 +79,9 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Rotate right / left (current or selected) | `]` or `⇧R` / `[` or `⇧L` |
 | Show the photo without its edit, while held (Cull view) | `Y` or `\` |
 | Clipping warnings, on / off (Cull view) | `J` |
+| Title, caption and keywords (current or selected) | `⌘K` / `Ctrl+K` |
 | Copy / paste edit (paste applies to the selection) | `⌘C` / `⌘V` or `⌘⇧C` / `⌘⇧V` (`Ctrl+C` / `V`, `Ctrl+Shift+C` / `V`) |
-| Export JPEG with the export settings (current or selected photos: edited ones and those without a JPEG are rendered, others copied unless resized) | `⌘⇧E` / `Ctrl+Shift+E` |
+| Export with the export settings (current or selected photos: edited ones and those without a JPEG are rendered, others copied unless resized, watermarked or in another format) | `⌘⇧E` / `Ctrl+Shift+E` |
 | Refresh the folder | `⌘R` / `Ctrl+R`, `F5` |
 | Show bursts, on / off | `B` |
 | Keep this photo, reject the rest of its burst | `⇧P` / `Shift+P` |
@@ -90,8 +97,6 @@ In the Cull view, marking a photo as keep or reject moves on to the next one (in
 
 ## Film simulations
 Film simulations are 3D LUTs, in the same HaldCLUT format RawTherapee uses (`.png` / `.tif`), or `.cube` files. Tamis does not ship any: choose a folder of them with **Folder…** in the edit panel (sub-folders become groups). RawTherapee's [film simulation collection](https://rawpedia.rawtherapee.com/Film_Simulation) (CC BY-SA) works as is, and gives the same looks as in RawTherapee. The base development of RAWs (LibRaw) is close to, but not identical with, RawTherapee's own.
-
-Things the first version does not do yet: the 1:1 zoom shows the original inside the frame (for focus checking).
 
 ## Plugins
 A plugin is a Python file (or a package folder) in the plugins folder, which **Plugins ▾ > Open Plugins Folder** creates and opens. Plugins load at launch, so restart Tamis after adding one. This is all it takes:
@@ -125,7 +130,7 @@ def register(tamis):
 | `version` | Tamis's version, such as `"0.1.0"`, to check compatibility (`"unknown"` when run from a checkout that was never installed) |
 | `window` | The main window, for anything else. It is not a stable interface: it may change between versions |
 
-`photos` is a photo or a path, or a list of them, and every `set_…` call is one undo step. A photo is a read-only snapshot with `path`, `name`, `files` (with its companions), `status`, `location`, `rating`, `label` and `edit`.
+`photos` is a photo or a path, or a list of them, and every `set_…` call is one undo step. A photo is a read-only snapshot with `path`, `name`, `files` (with its companions), `status`, `location`, `rating`, `label`, `edit` and `metadata` (its `title`, `caption` and `keywords`, those that are set).
 
 | Event | Arguments | When |
 | --- | --- | --- |
@@ -133,7 +138,7 @@ def register(tamis):
 | `photo_changed` | `photo` | Another photo became the current one |
 | `photos_edited` | `[photos]` | Marks, ratings, labels or edits changed, undo included |
 | `files_moved` | `{old path: new path}` | Process Files moved photos. Photos are identified by path, so a plugin keeping data per photo must follow this |
-| `photos_exported` | `[paths]` | JPEGs were written to the export folder |
+| `photos_exported` | `[paths]` | Photos were written to the export folder |
 | `photos_trashed` | `[paths]` | Photos of `_REJECTS` were moved to the Trash |
 | `closing` | | The window is closing; changes made now are still saved |
 
@@ -166,20 +171,26 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/models.py` | Photo list model, gallery filter, folder scan and session file |
 | `tamis/loader.py` | Background preview/thumbnail loading, caching and prefetching |
 | `tamis/thumbcache.py` | Thumbnails on disk |
-| `tamis/analysis.py` | Background capture dates, sharpness scores and perceptual hashes, remembered on disk |
+| `tamis/analysis.py` | Background capture dates, sharpness scores, perceptual hashes and faces, remembered on disk |
+| `tamis/faces.py` | Faces with Apple's Vision (macOS): closed eyes, face sharpness, where a face is once framed |
 | `tamis/bursts.py` | Grouping shots taken in quick succession |
 | `tamis/peaking.py` | Focus peaking overlay and its background worker |
 | `tamis/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
 | `tamis/exif.py` | Minimal EXIF reader for shooting info, and the EXIF of exported JPEGs |
-| `tamis/xmp.py` | Reading and editing ratings and labels in XMP sidecars |
+| `tamis/xmp.py` | Reading and editing ratings, labels, titles, captions and keywords in XMP sidecars |
 | `tamis/develop.py` | Edit pipeline (numpy): turns and straightening, exposure, tone, colour, LUT, grain, vignette |
 | `tamis/cropping.py` | Geometry of the crop frame while it is dragged |
 | `tamis/lut.py` | HaldCLUT / `.cube` loading and fast 256³ lookup tables |
-| `tamis/editing.py` | Developing photos for editing, background previews and thumbnails of edits, JPEG export |
+| `tamis/editing.py` | Developing photos for editing, background previews, full-resolution renders and thumbnails of edits, export |
 | `tamis/editpanel.py` | The edit panel and its histogram |
 | `tamis/tones.py` | Histograms and clipping overlays, and their background worker |
 | `tamis/presets.py` | Named looks, kept in the app's data folder |
-| `tamis/exportsettings.py` | Export size, quality, folder, name pattern and profiles |
+| `tamis/exportsettings.py` | Export format, size, quality, folder, name pattern, watermark, credits and profiles |
+| `tamis/watermark.py` | Painting a text or logo watermark on exports |
+| `tamis/stego.py` | The hidden mark: a short text written invisibly into the pixels, and read back |
+| `tamis/metadata.py` | Titles, captions, keywords and credits as XMP and IPTC-IIM in exported JPEGs |
+| `tamis/keeplists.py` | Lists of keeps for other editors (Lightroom, one per line, CSV) |
+| `tamis/updates.py` | Asking GitHub whether a newer version is out |
 | `tamis/fileops.py` | Planning and executing file moves, exports, the Trash and imports |
 | `tamis/shortcuts.py` | The table of keyboard shortcuts: defaults, the user's changes, conflicts |
 | `tamis/shortcutsdialog.py` | The shortcut overview (`?`) and the editor |
@@ -212,9 +223,15 @@ python scripts/sharpness_report.py <culled folder>   # sharpness scores against 
 `startup_time.py` runs the app with `TAMIS_STARTUP_TIME` set to the folder: it opens it with settings and caches of its own, prints when the first preview is shown and quits. `sharpness_report.py` writes a CSV, a contact sheet sorted by score and a summary into `sharpness_report/<shoot name>` (or `--out`), never into the shoot, and prints how well `soft` would have matched your rejects at several ratios. Each shoot gets its own report: running it again on the same shoot replaces that one, and another shoot of the same name gets `<name> (2)`.
 
 ### Releases
-`scripts/build_app.sh` gives the bundle the version of `pyproject.toml` (`CFBundleShortVersionString`) and signs it ad hoc, which is enough on the Mac that built it. For anyone else, `scripts/package_macos.sh` signs it with a Developer ID (hardened runtime, `scripts/entitlements.plist`), wraps it in `dist/Tamis-<version>.dmg`, and notarizes and staples that; its header lists the environment variables it needs.
+`scripts/build_app.sh` gives the bundle the version of `pyproject.toml` (`CFBundleShortVersionString`) and signs it ad hoc. `scripts/package_macos.sh` wraps it in `dist/Tamis-<version>.dmg` and a `.zip`.
 
-Pushing a tag such as `v0.2.0` (matching `pyproject.toml`) runs `.github/workflows/release.yml`, which does all of that and publishes the DMG as a GitHub release. It needs an Apple Developer account and these repository secrets: `MACOS_CERTIFICATE` (the Developer ID Application certificate and key, as a base64 `.p12`), `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`, and an App Store Connect API key for notarization: `NOTARY_KEY` (base64 `.p8`), `NOTARY_KEY_ID`, `NOTARY_ISSUER`.
+Pushing a tag such as `v0.2.0` (matching `pyproject.toml`) runs `.github/workflows/release.yml`, which tests, builds and packages the app and publishes the DMG and zip as a GitHub release with generated notes. No Apple Developer account is needed: the app is signed ad hoc and not notarized, so **macOS blocks it the first time it is opened**. To open it anyway: try once, then **System Settings › Privacy & Security › Open Anyway**; or in Terminal:
+```bash
+xattr -dr com.apple.quarantine /Applications/Tamis.app
+```
+The release notes say so too. With an Apple Developer account, setting the repository secrets `MACOS_CERTIFICATE` (the Developer ID Application certificate and key, as a base64 `.p12`), `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGN_IDENTITY`, and for notarization `NOTARY_KEY` (an App Store Connect API key, base64 `.p8`), `NOTARY_KEY_ID` and `NOTARY_ISSUER`, makes the same workflow sign the app with that Developer ID (hardened runtime, `scripts/entitlements.plist`) and notarize the DMG; `package_macos.sh`'s header lists the matching environment variables for doing it locally.
+
+Tamis tells its users about new releases by itself (see **New versions** above), from the release's tag.
 
 ## Development Notes
 - Worker threads only produce `QImage`; `QPixmap` is created on the GUI thread.

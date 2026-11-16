@@ -15,7 +15,7 @@ from html import escape
 from PyQt6.QtCore import QEventLoop, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import QDialog, QProgressDialog
 
-from . import exportsettings, lut
+from . import exportsettings, lut, metadata, watermark
 from .constants import KEEP, REJECT, REJECT_DIR
 from .editing import export_photo
 from .exportsettings import ExportSettings
@@ -56,15 +56,15 @@ def _names(paths, limit=5):
 
 
 class ExportThread(QThread):
-    """Renders edited photos to JPEG (or copies unedited ones) off the GUI thread."""
+    """Renders edited photos in the format of the settings (or copies unedited JPEGs) off the GUI thread."""
 
     progressed = pyqtSignal(int)
 
     def __init__(self, jobs, dest_dir, settings=None, protected=(), parent=None):
         super().__init__(parent)
-        # [(path, edit, LUT path, name)]: an unedited JPEG is copied (unless it must be
-        # resized), anything else rendered; name None picks a free one
-        self.jobs = jobs
+        # [(path, edit, LUT path, name, photo metadata)]: an unedited JPEG is copied (unless it must be
+        # resized, watermarked or turned into another format), anything else rendered; name None picks a free one
+        self.jobs = [(*job, {})[:5] for job in jobs]
         self.dest_dir = dest_dir
         self.settings = settings or ExportSettings()
         # Files never to write over, the photos': only a mistaken destination would get there.
@@ -93,6 +93,15 @@ class ExportThread(QThread):
                     tables[lut_path] = lut.build_table(lut.load_grid(lut_path))
                 return tables[lut_path]
 
+        logo = None
+        if self.settings.watermark_image:
+            try:
+                logo = watermark.load_logo(self.settings.watermark_image)
+            except watermark.WatermarkError as exc:  # nothing can be exported as asked
+                self.errors = [f"{os.path.basename(job[0])}: {exc}" for job in self.jobs]
+                self.progressed.emit(len(self.jobs))
+                return
+
         def worker():
             nonlocal done
             while True:
@@ -102,13 +111,15 @@ class ExportThread(QThread):
                     job = next(pending, None)
                     if job is None:
                         return
-                    index, (path, edit, lut_path, name) = job
+                    index, (path, edit, lut_path, name, photo_metadata) = job
                     if name is None:  # two photos named alike must not pick the same free name
                         stem, ext = os.path.splitext(os.path.basename(path))
-                        name = free_name(self.dest_dir, stem, ext if self._copies(job[1]) else ".jpg", reserved)
+                        name = free_name(self.dest_dir, stem, ext if self._copies(job[1]) else self.settings.extension, reserved)
                         reserved.add(name)
                 try:
-                    results[index] = (self._export(path, edit, lut_path and table(lut_path), name), path)
+                    results[index] = (
+                        self._export(path, edit, lut_path and table(lut_path), name, photo_metadata, logo), path
+                    )
                 except Exception as exc:  # one bad photo must not stop the others
                     log.exception("Exporting %s failed", path)
                     results[index] = f"{os.path.basename(path)}: {exc}"
@@ -134,17 +145,17 @@ class ExportThread(QThread):
 
     def _copies(self, job):
         """Whether `job` copies the photo's JPEG rather than rendering it."""
-        path, edit, _lut_path, _name = job
-        return not (edit or not is_jpeg(path) or self.settings.resizes)
+        path, edit = job[:2]
+        return not edit and is_jpeg(path) and self.settings.copies_jpegs
 
-    def _export(self, path, edit, table, name):
+    def _export(self, path, edit, table, name, photo_metadata=None, logo=None):
         if name is not None and os.path.normcase(os.path.abspath(os.path.join(self.dest_dir, name))) in self.protected:
             raise OSError(errno.EEXIST, "a photo has that name in the export folder")
-        if self._copies((path, edit, None, name)):
-            return copy_export(path, self.dest_dir, name)
+        if self._copies((path, edit)):
+            return copy_export(path, self.dest_dir, name, metadata.for_export(self.settings, photo_metadata))
         return export_photo(
-            path, edit, None, self.dest_dir, quality=self.settings.quality, name=name,
-            long_edge=self.settings.long_edge, table=table,
+            path, edit, None, self.dest_dir, name=name, table=table,
+            settings=self.settings, logo=logo, photo_metadata=photo_metadata,
         )
 
 
@@ -209,7 +220,7 @@ class ProcessingMixin:
     # -- exporting ---------------------------------------------------------
 
     def export_photos(self):
-        """Export the target photos, with their edits, as full-size JPEGs in _EXPORTS."""
+        """Export the target photos, with their edits, as the export settings say."""
         self._finish_crop(apply=True)
         rows = self._target_rows()
         if not rows or self.moving:
@@ -230,8 +241,10 @@ class ProcessingMixin:
                 return
         if not self._export_folder_ok():
             return
-        jobs = [(p.path if p.edit else jpeg_file(p) or p.path, p.edit, self._lut_path(p.edit), None) for p in photos]
-        thread = self._run_export(jobs, "Export JPEG")
+        jobs = [
+            (p.path if p.edit else jpeg_file(p) or p.path, p.edit, self._lut_path(p.edit), None, p.metadata) for p in photos
+        ]
+        thread = self._run_export(jobs, "Export")
         if not self._report_export_errors(thread, len(jobs)):
             count = f"{len(thread.exported)} of {len(jobs)}" if thread.stopped else len(thread.exported)
             done = "Stopped: exported" if thread.stopped else "Exported"
@@ -485,7 +498,7 @@ class ProcessingMixin:
 
         # Planned again: the photos may have just moved.
         exports = self._plan_exports()
-        jobs = [(job.path, job.edit, self._lut_path(job.edit), job.name) for job in exports]
+        jobs = [(job.path, job.edit, self._lut_path(job.edit), job.name, job.metadata) for job in exports]
         thread = self._run_export(jobs, "Process files") if jobs else None
         if thread is None or not self._report_export_errors(thread, len(jobs)):
             done = [summary_text]
@@ -507,6 +520,7 @@ class ProcessingMixin:
         no_jpeg = [photo.path for photo in without_export(self.model.photos, keeps_only)]
         removable, changed = rejected_exports(self.model.photos, self.folder)
         edited = sum(1 for job in exports if job.edit)
+        kind = settings.file_format.title.split(",")[0]
         if exports:
             label = f"Export {len(exports)} photo(s) to {settings.folder}"
         elif removable:
@@ -515,9 +529,9 @@ class ProcessingMixin:
             label = "Nothing to export" + (" (no keeps)" if keeps_only else "")
         details = []
         if edited:
-            details.append(f"&nbsp;&nbsp;• {edited} edited → rendered as JPEG")
+            details.append(f"&nbsp;&nbsp;• {edited} edited → rendered as {kind}")
         if len(exports) - edited:
-            how = "rendered as JPEG" if settings.resizes else "JPEG copied"
+            how = "JPEG copied" if settings.copies_jpegs else f"rendered as {kind}"
             details.append(f"&nbsp;&nbsp;• {len(exports) - edited} without edits → {how}")
         if removable:
             details.append(f"&nbsp;&nbsp;• {len(removable)} earlier export(s) of rejected photos → removed")
@@ -544,7 +558,8 @@ class ProcessingMixin:
             keeps_only = self.export_scope == "keeps"
         # By name, whatever the order shown: which photo gets `IMG_1 (1).jpg` must not depend on it.
         return plan_exports(
-            sorted(self.model.photos, key=by_name), keeps_only, self.export_settings.pattern, os.path.basename(self.folder)
+            sorted(self.model.photos, key=by_name), keeps_only, self.export_settings.pattern, os.path.basename(self.folder),
+            self.export_settings.extension,
         )
 
     def _move_files(self, moves):
@@ -561,6 +576,7 @@ class ProcessingMixin:
         self.editor.rename_paths(result.moved)
         self.edit_thumbnails.rename_paths(result.moved)
         self.xmp_dirty = {result.moved.get(path, path) for path in self.xmp_dirty}
+        self.xmp_metadata_dirty = {result.moved.get(path, path) for path in self.xmp_metadata_dirty}
         self.moved_keys.update(relative_key(self.folder, old) for old in result.moved)
         # Undo entries name photos by path: they follow them, so a mark can still be undone (the files move on the next run).
         self.undo_stack = [[(result.moved.get(path, path), name, value) for path, name, value in undo] for undo in self.undo_stack]

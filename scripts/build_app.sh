@@ -3,8 +3,8 @@
 # dist/Tamis/ elsewhere. Run from an environment with `pip install -e ".[build]"`.
 #
 # On macOS the bundle gets the version of pyproject.toml and is signed ad hoc,
-# which is enough on this Mac. scripts/package_macos.sh signs it with a
-# Developer ID, notarizes it and wraps it in a DMG, for anyone else.
+# which is enough on this Mac. scripts/package_macos.sh wraps it in a DMG for a
+# release (and signs it with a Developer ID and notarizes it, given one).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -30,15 +30,15 @@ python -m PyInstaller \
     --collect-binaries rawpy \
     --copy-metadata tamis \
     --exclude-module PyQt6.QtDBus \
-    --exclude-module PyQt6.QtNetwork \
+    --hidden-import PyQt6.QtNetwork \
     --add-data tamis/resources:tamis/resources \
     ${icon_args[@]+"${icon_args[@]}"} \
     Tamis.py
 
 # Qt plugins Tamis doesn't use, and the frameworks only they need: PDFs as images
-# (QtPdf, which pulls QtNetwork in) and TUIO touch over the network.
+# and TUIO touch over the network. (QtNetwork stays: it asks GitHub for new versions.)
 find dist/Tamis.app dist/Tamis -depth \( -name "libqpdf.*" -o -name "libqtuiotouchplugin.*" \
-    -o -name "QtPdf.framework" -o -name "QtNetwork.framework" -o -name "*Qt6Pdf*" -o -name "*Qt6Network*" \) \
+    -o -name "QtPdf.framework" -o -name "*Qt6Pdf*" \) \
     -exec rm -rf {} + 2>/dev/null || true
 
 if [[ "$(uname)" == "Darwin" ]]; then

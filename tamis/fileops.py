@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 from PyQt6.QtCore import QFile
 
-from . import exif, exportsettings
+from . import exif, exportsettings, metadata
 from .constants import EXPORT_DIR, KEEP, KEEP_DIR, REJECT, REJECT_DIR, SUPPORTED_EXTENSIONS, is_raw
 
 
@@ -25,6 +25,7 @@ class ExportJob:
     path: str  # the file rendered or copied
     edit: dict  # {}: copied as it is
     name: str  # file name in the export folder
+    metadata: dict = field(default_factory=dict)  # the photo's title, caption and keywords
 
 
 @dataclass
@@ -190,10 +191,12 @@ def exported_statuses(keeps_only=False):
     return (KEEP,) if keeps_only else (KEEP, None)
 
 
-def plan_exports(photos, keeps_only=False, pattern="{name}", folder_name=""):
+def plan_exports(photos, keeps_only=False, pattern="{name}", folder_name="", extension=".jpg"):
     """What "Process Files" exports: edited photos rendered, the JPEG of the others copied.
 
     Rejected photos are left out, and unmarked ones too with `keeps_only`.
+    Rendered files get `extension`; with another than ".jpg" (another format),
+    unedited photos are rendered from their JPEG too, and named with it.
     Files are named by `pattern` (see exportsettings.file_stem()), made unique
     within the plan (` (n)` added when two photos share one name); a file of
     the same name already at the destination is replaced, so processing again
@@ -205,9 +208,10 @@ def plan_exports(photos, keeps_only=False, pattern="{name}", folder_name=""):
         if photo.status not in wanted:
             continue
         if photo.edit:
-            chosen.append((photo, photo.path, os.path.splitext(photo.name)[0], ".jpg"))
+            chosen.append((photo, photo.path, os.path.splitext(photo.name)[0], extension))
         elif (jpeg := jpeg_file(photo)) is not None:
-            chosen.append((photo, jpeg, *os.path.splitext(os.path.basename(jpeg))))
+            stem, ext = os.path.splitext(os.path.basename(jpeg))
+            chosen.append((photo, jpeg, stem, ext if extension == ".jpg" else extension))
 
     jobs, taken = [], set()
 
@@ -224,7 +228,7 @@ def plan_exports(photos, keeps_only=False, pattern="{name}", folder_name=""):
             moment = photo.capture_time if photo.capture_time is not None else exif.capture_time(photo.files)
             date = exportsettings.date_text(moment)
         stem = exportsettings.file_stem(pattern, stem, date, seq, len(chosen), folder_name)
-        jobs.append(ExportJob(path, photo.edit, unique(stem, ext)))
+        jobs.append(ExportJob(path, photo.edit, unique(stem, ext), getattr(photo, "metadata", {})))
     return jobs
 
 
@@ -312,18 +316,27 @@ def remove_rejected_exports(photos, shoot_folder):
     return removed, errors
 
 
-def copy_export(path, dest_dir, name=None):
+def copy_export(path, dest_dir, name=None, data=None):
     """Copy `path` into `dest_dir`; returns the new path.
 
     With `name` the file is written under that name, replacing one already
-    there; without, it gets a free name (`IMG_1 (1).jpg`).
+    there; without, it gets a free name (`IMG_1 (1).jpg`). With `data` (see
+    metadata.for_export()), a JPEG gets that title, caption, keywords and
+    credits added, its pixels untouched.
     """
     os.makedirs(dest_dir, exist_ok=True)
     if name is None:
         name = free_name(dest_dir, *os.path.splitext(os.path.basename(path)))
     dest = os.path.join(dest_dir, name)
     with atomic_write(dest) as tmp_path:
-        shutil.copy2(path, tmp_path)
+        if data and is_jpeg(path):
+            with open(path, "rb") as file:
+                content = metadata.with_metadata(file.read(), data)
+            with open(tmp_path, "wb") as file:
+                file.write(content)
+            shutil.copystat(path, tmp_path)
+        else:
+            shutil.copy2(path, tmp_path)
     return dest
 
 

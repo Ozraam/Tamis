@@ -1,6 +1,8 @@
 import math
 import os
 import platform
+import sys
+import time
 from html import escape
 
 import rawpy
@@ -9,6 +11,7 @@ from PyQt6.QtCore import (
     QT_VERSION_STR,
     QFileSystemWatcher,
     QItemSelectionModel,
+    QPointF,
     QSettings,
     QStandardPaths,
     Qt,
@@ -19,6 +22,7 @@ from PyQt6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence, Q
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QMainWindow,
     QMenu,
@@ -29,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, bursts, develop, exportsettings, logs, shortcuts, xmp
+from . import __version__, bursts, develop, exportsettings, faces, logs, metadata, shortcuts, updates, xmp
 from .analysis import PhotoAnalyzer
 from .constants import (
     APP_NAME,
@@ -42,7 +46,7 @@ from .constants import (
     REJECT,
     UNDO_LIMIT,
 )
-from .editing import EditRenderer, EditThumbnails
+from .editing import EditRenderer, EditThumbnails, read_hidden_mark
 from .editpanel import EditPanel
 from .editui import EditingMixin
 from .exif import summary
@@ -59,7 +63,18 @@ from .shortcutsdialog import ShortcutsDialog, ShortcutsEditor
 from .thumbcache import ThumbnailCache
 from .tones import ToneReader
 from .views import CompareView, ImageView
-from .widgets import GalleryToolbar, HeaderBar, StatsBar, ThumbnailDelegate, Toast, inform, make_thumbnail_view
+from .widgets import (
+    AboutDialog,
+    GalleryToolbar,
+    HeaderBar,
+    KeepsListDialog,
+    MetadataDialog,
+    StatsBar,
+    ThumbnailDelegate,
+    Toast,
+    inform,
+    make_thumbnail_view,
+)
 
 FILMSTRIP_THUMB_SIZE = 64
 
@@ -73,7 +88,7 @@ MARK_LABELS = {KEEP: "Green", REJECT: "Red"}
 
 
 class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMainWindow):
-    def __init__(self, plugins_dir=None, cache_dir=None, presets_file=None):
+    def __init__(self, plugins_dir=None, cache_dir=None, presets_file=None, check_updates=True):
         super().__init__()
         self.setWindowTitle("Tamis")
         self.setMinimumSize(900, 600)
@@ -86,6 +101,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         self.session_warning = None  # last session problem shown, so it is shown once
         self.xmp_warned = False
         self.xmp_dirty = set()  # photos whose rating/label still has to be written to XMP
+        self.xmp_metadata_dirty = set()  # those of them whose title, caption or keywords changed too
         self.moved_keys = set()  # session keys of moved photos, until a save has dropped them
         self.damaged_sessions = set()  # session files the user was told about
         self.folder = ""
@@ -108,6 +124,9 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         if self.sort_order not in SORT_KEYS:
             self.sort_order = "name"
         self.show_bursts = self.settings.value("show_bursts", False, type=bool)
+        # Closed eyes and soft faces, looked for in the background (macOS, with Vision) when asked.
+        self.detect_faces = faces.available() and self.settings.value("detect_faces", False, type=bool)
+        self.face_zoom_pending = False  # Shift+Z waits for the faces of the photos shown
         self.peaking = False
         self.xmp_marks = self.settings.value("xmp_marks", "off")
         if self.xmp_marks not in dict(XMP_MARKS):
@@ -151,6 +170,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         self.model.set_edit_thumbnails(self.edit_thumbnails, self._lut_path)
         self.model.statuses_changed.connect(self._on_statuses_changed)
         self.model.ratings_changed.connect(lambda paths: self.xmp_dirty.update(paths))
+        self.model.metadata_changed.connect(lambda paths: self.xmp_metadata_dirty.update(paths))
         self.model.marks_changed.connect(self._on_marks_changed)
         self.proxy = StatusFilterProxy(self)
         self.proxy.setSourceModel(self.model)
@@ -185,6 +205,14 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         self.plugins_button.setMenu(self.plugins.menu)
         self.plugins.load()
         QTimer.singleShot(0, self._restore_last_folder)
+        self.updates = updates.UpdateChecker(__version__, self)
+        self.updates.checked.connect(self._on_update_checked)
+        self.available_update = None  # an updates.Release newer than this version, once known
+        self.about_dialog = None  # while About is open, to show what a check finds
+        self.update_check_manual = False
+        # Off in the tests, which never ask GitHub (and a few seconds late: the photos come first).
+        if check_updates and self._update_check_due():
+            QTimer.singleShot(3000, self.check_for_updates)
         if self.presets.problem:
             QTimer.singleShot(0, lambda: self.toast.show_message(self.presets.problem, 6000))
 
@@ -260,6 +288,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         self.gallery_toolbar.sort_changed.connect(self.set_sort_order)
         self.gallery_toolbar.bursts_toggled.connect(self.set_bursts)
         self.gallery_toolbar.size_changed.connect(self._on_grid_size_changed)
+        self.gallery_toolbar.set_faces(self.detect_faces)
         self.grid_delegate = ThumbnailDelegate(grid_size, show_names=True, parent=self)
         self.grid = make_thumbnail_view(self.proxy, self.grid_delegate, horizontal=False)
         self.grid.selectionModel().currentChanged.connect(self._on_grid_current_changed)
@@ -332,12 +361,52 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             group.addAction(action)
             marks.addAction(action)
             self.xmp_mark_actions[value] = action
+        if faces.available():
+            self.faces_action = QAction("Look for Closed Eyes and Soft Faces", self, checkable=True, checked=self.detect_faces)
+            self.faces_action.toggled.connect(self.set_detect_faces)
+            menu.addAction(self.faces_action)
         menu.addAction("Export Settings…", self.edit_export_settings)
+        menu.addAction("List of Keeps for Other Editors…", self.show_keeps_list)
+        menu.addAction("Read a Hidden Mark…", self.read_hidden_mark)
         menu.addAction("Keyboard Shortcuts…", self.edit_shortcuts)
         menu.addSeparator()
+        self.update_check_action = QAction(
+            "Check for Updates Automatically", self, checkable=True, checked=self.settings.value("check_updates", True, type=bool)
+        )
+        self.update_check_action.toggled.connect(lambda on: self.settings.setValue("check_updates", on))
+        menu.addAction(self.update_check_action)
         menu.addAction("Show Log File", self.show_log_file)
         menu.addAction(f"About {APP_NAME}…", self.show_about)
         return menu
+
+    def show_keeps_list(self):
+        """Copy or save the names of the keeps, or of what the Gallery shows, for another editor."""
+        if not self.folder:
+            return
+        keeps = [photo for photo in self.model.photos if photo.status == KEEP]
+        shown = [self.model.photo(self.proxy.mapToSource(self.proxy.index(row, 0)).row()) for row in range(self.proxy.rowCount())]
+        choices = [("keeps", "Keeps", keeps), ("shown", "Photos the Gallery shows", shown)]
+        dialog = KeepsListDialog(self, choices, self.folder)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            self.toast.show_message(f"Copied the names of {len(dialog.which[1])} photo(s)")
+        elif dialog.saved:
+            self.toast.show_message(f"Saved {os.path.basename(dialog.saved)}")
+
+    def read_hidden_mark(self, path=None):
+        """Say what hidden mark (see the export settings) an image carries."""
+        if path is None:
+            start = self.export_settings.dest_dir(self.folder) if self.folder else os.path.expanduser("~")
+            path, _filter = QFileDialog.getOpenFileName(self, "Read a hidden mark", start)
+            if not path:
+                return
+        text = read_hidden_mark(path)
+        name = escape(os.path.basename(path))
+        if text is None:
+            inform(self, "No hidden mark", f"No hidden mark was found in {name}. A mark is lost when a picture "
+                   "is resized, cropped or rotated, or saved again at a low JPEG quality.")
+        else:
+            inform(self, "Hidden mark", f"{name} carries: <b>{escape(text)}</b>")
 
     def show_log_file(self):
         """Where warnings, errors and crashes are written, to attach to a bug report."""
@@ -347,14 +416,69 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         QDesktopServices.openUrl(QUrl.fromLocalFile(logs.path))
 
     def show_about(self):
-        """The app's version, and those of what it is built on, for bug reports."""
+        """The app's version, and those of what it is built on, for bug reports, and whether a newer one is out."""
         libraw = ".".join(str(part) for part in rawpy.libraw_version)
         text = (
             f"Version <b>{escape(__version__)}</b><br><br>"
             f"Python {platform.python_version()} · Qt {QT_VERSION_STR} · PyQt {PYQT_VERSION_STR} · LibRaw {libraw}<br>"
             f"{escape(platform.platform(terse=True))}"
         )
-        inform(self, APP_NAME, text)
+        update = self._update_text(self.available_update) if self.available_update else ""
+        check = self._check_now if self.updates.can_check() else None
+        self.about_dialog = AboutDialog(self, APP_NAME, text, update, check)
+        try:
+            self.about_dialog.exec()
+        finally:
+            self.about_dialog = None
+
+    # -- updates -----------------------------------------------------------
+
+    def _update_check_due(self):
+        if not self.settings.value("check_updates", True, type=bool) or not self.updates.can_check():
+            return False
+        last = self.settings.value("update_checked_at", 0.0, type=float)
+        return not 0 <= time.time() - last < updates.CHECK_INTERVAL
+
+    def check_for_updates(self, manual=False):
+        """Ask GitHub whether a newer version is out; automatic checks keep quiet about failures."""
+        self.update_check_manual = self.update_check_manual or manual
+        self.updates.check()
+
+    def _check_now(self):
+        self.check_for_updates(manual=True)
+
+    @staticmethod
+    def _update_text(release):
+        how = "Download it" if getattr(sys, "frozen", False) else "Download it, or update your copy (git pull)"
+        return (
+            f"<b>{APP_NAME} {escape(release.version)} is available.</b> "
+            f'{how} from <a href="{escape(release.url)}">its release page</a>.'
+        )
+
+    def _on_update_checked(self, result):
+        manual, self.update_check_manual = self.update_check_manual, False
+        if result.error is None:
+            self.settings.setValue("update_checked_at", time.time())
+        self.available_update = result.newer
+        if self.about_dialog is not None:
+            if result.newer:
+                self.about_dialog.set_update(self._update_text(result.newer))
+            elif result.error:
+                self.about_dialog.set_update(escape(result.error))
+            else:
+                self.about_dialog.set_update(f"{APP_NAME} {escape(__version__)} is the latest version.")
+            return
+        if result.newer and (manual or self.settings.value("update_dismissed", "") != result.newer.version):
+            # Shown once per version: About keeps saying it.
+            self.settings.setValue("update_dismissed", result.newer.version)
+            url = result.newer.url
+            self.toast.show_message(
+                f"{APP_NAME} {result.newer.version} is available · click to see it",
+                8000,
+                on_click=lambda: QDesktopServices.openUrl(QUrl(url)),
+            )
+        elif manual:
+            self.toast.show_message(result.error or f"{APP_NAME} {__version__} is the latest version", 4000)
 
     def _shortcut_slots(self):
         """What each command of `shortcuts.COMMANDS` does."""
@@ -374,6 +498,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             "toggle_tab": self.toggle_tab,
             "keeps_only": self.toggle_keeps_only,
             "zoom": self.toggle_zoom,
+            "zoom_face": self.zoom_to_faces,
             "escape": self.escape,
             "compare": self.toggle_compare,
             "info": self.toggle_info,
@@ -389,6 +514,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             "rotate_left": lambda: self.rotate_photos(-90),
             "copy_edit": self.copy_edit,
             "paste_edit": self.paste_edit,
+            "metadata": self.edit_metadata,
             "open": self.choose_folder,
             "import": self.import_photos,
             "refresh": self.refresh,
@@ -473,6 +599,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         # Previews are downscaled, so while zoomed the photos load at full resolution.
         self.loader.ensure_full([self.model.photo(row).path for _, row in shown], load=zoomed)
         self.editor.keep_requests({self.model.photo(row).path for _, row in shown})
+        self.editor.keep_full_requests({self.model.photo(row).path for _, row in shown} if zoomed else set())
         for view, row in shown:
             self._show_in(view, row, zoomed)
 
@@ -497,12 +624,19 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         view.set_active(bool(self.compare_rows) and row == self.current_row)
         shown = pixmap
         if zoomed and pixmap is not None:
+            # The edit itself at full resolution, rendered in the background; the original in its frame until then.
+            edited, current = self._edited_full(photo)
             full = self.loader.full_pixmap(photo.path)
-            if full is not None:
+            if edited is not None:
+                shown = edited
+                view.set_full_image(shown)
+            elif full is not None:
                 shown = self._framed(full, framing)
                 view.set_full_image(shown)
             else:
                 view.set_full_loading(self.loader.full_error(photo.path) is None)
+            if not current:
+                view.set_full_loading(True, "Rendering the edit at full resolution…")
         peaks = self.peaking and shown is not None and not self.cropping
         view.set_overlay(self.peaker.overlay(shown) if peaks else None)
         clipping = self.show_clipping and shown is not None and not self.cropping
@@ -519,10 +653,16 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
 
     def _info_lines(self, photo):
         lines = summary(self.loader.info(photo.path))
+        if photo.metadata.get("title"):
+            lines.insert(0, photo.metadata["title"])
         median = self.model.median_sharpness()
         if photo.sharpness is not None and median is not None:
             soft = " · looks soft" if self.model.is_soft(self.model.row_of(photo.path)) else ""
             lines.append(f"Sharpness {photo.sharpness:.0f} · folder median {median:.0f}{soft}")
+        if photo.faces:
+            issue = self.model.face_issue(self.model.row_of(photo.path))
+            count = len(faces.main_faces(photo.faces))
+            lines.append(f"{count} face{'s' * (count != 1)}" + (f" · {issue}" if issue else ""))
         return lines
 
     def _is_shown(self, path):
@@ -539,6 +679,47 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
 
     def _on_zoom_changed(self, _zoomed):
         self._refresh_view()
+
+    def zoom_to_faces(self):
+        """Zoom 1:1 on each photo's own main face, at the same scale: a subject moves between the frames of a burst.
+
+        A photo without a face (or whose faces aren't known yet) keeps the shared zoom.
+        """
+        if self.cropping or self.current_row < 0:
+            return
+        if not faces.available():
+            self.toast.show_message("Finding faces needs macOS (Apple's Vision)", 3000)
+            return
+        photos = [self.model.photo(row) for row in self._shown_rows()]
+        unknown = [photo for photo in photos if photo.faces is None]
+        if unknown:
+            self.face_zoom_pending = True
+            self.analyzer.request(faces=unknown)
+            self.toast.show_message("Looking for faces…")
+            return
+        self.face_zoom_pending = False
+        centers = []
+        for photo in photos:
+            face = faces.main_face(photo.faces)
+            native = self.loader.native_size(photo.path)
+            size = (native.width(), native.height()) if native is not None and native.isValid() else (3, 2)
+            point = faces.framed_point(*face.center, self._shown_edit(photo), size) if face else None
+            centers.append(QPointF(*point) if point else None)
+        if not any(centers):
+            self.toast.show_message("No face found" if len(photos) == 1 else "No face found in these photos", 3000)
+            return
+        if self.compare_rows:
+            self.compare_view.zoom_to(centers)
+        else:
+            self.image_view.zoom_to(centers[0])
+
+    def set_detect_faces(self, on):
+        self.detect_faces = on
+        self.settings.setValue("detect_faces", on)
+        self.gallery_toolbar.set_faces(on)
+        self.toast.show_message("Looking for closed eyes and soft faces" if on else "Not looking for faces")
+        self._request_analysis()
+        self._show_analysis()
 
     def toggle_zoom(self):
         if self.cropping:
@@ -650,6 +831,22 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             first_visible = self._first_visible(rows)
             self._push_undo(self.model.set_field(rows, "rating", stars))
             self._reselect_in_gallery(first_visible)  # a star filter may have hidden them
+
+    def edit_metadata(self):
+        """Title, caption and keywords of the target photos, as one undo step."""
+        rows = self._target_rows()
+        if not rows:
+            return
+        dialog = MetadataDialog(self, [self.model.photo(row).metadata for row in rows])
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.changes:
+            return
+        values = {
+            row: metadata.clean({**self.model.photo(row).metadata, **dialog.changes}) for row in rows
+        }
+        self._push_undo(self.model.set_values("metadata", values))
+        self.toast.show_message(f"Saved for {len(rows)} photo(s)" if len(rows) > 1 else "Saved")
+        if self.show_info:
+            self._refresh_view()
 
     def set_label(self, label):
         """Give `label` to the target photos, or remove it if they all have it already."""
@@ -797,7 +994,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             images = photos
         else:
             images = [photo for photo in photos if photo.burst]  # to find their sharpest frame
-        self.analyzer.request(capture, images)
+        self.analyzer.request(capture, images, photos if self.detect_faces else [])
 
     def _on_analyzed(self, path, results):
         row = self.model.row_of(path)
@@ -805,9 +1002,12 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             return
         photo = self.model.photo(row)
         for name, value in results.items():
-            setattr(photo, name, value)
+            setattr(photo, name, faces.faces_from_json(value) if name == "faces" else value)
         if not self.analysis_timer.isActive():
             self.analysis_timer.start()
+        shown = self._shown_rows()
+        if self.face_zoom_pending and "faces" in results and all(self.model.photo(row).faces is not None for row in shown):
+            self.zoom_to_faces()
 
     def _show_analysis(self):
         self.analysis_timer.stop()

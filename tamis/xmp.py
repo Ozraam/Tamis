@@ -1,4 +1,5 @@
-"""Star ratings and colour labels in XMP sidecars (xmp:Rating, xmp:Label).
+"""Star ratings and colour labels in XMP sidecars (xmp:Rating, xmp:Label), and titles,
+captions and keywords (dc:title, dc:description, dc:subject).
 
 These are the properties Lightroom, Bridge and Capture One read from
 sidecars, and darktable reads xmp:Rating. There is no pick or reject flag that
@@ -28,6 +29,14 @@ _RATING_ELEMENT = re.compile(r'[ \t]*<xmp:Rating>\s*(-?\d+)\s*</xmp:Rating>[ \t]
 _LABEL_ATTR = re.compile(r'\s+xmp:Label\s*=\s*(["\'])(.*?)\1', re.S)
 _LABEL_ELEMENT = re.compile(r'[ \t]*<xmp:Label>(.*?)</xmp:Label>[ \t]*\n?', re.S)
 _DESCRIPTION = re.compile(r'<rdf:Description\b')
+_DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
+_DC_TAGS = {"title": "dc:title", "caption": "dc:description", "keywords": "dc:subject"}
+_LI = re.compile(r'<rdf:li\b([^>]*)>(.*?)</rdf:li>', re.S)
+
+
+def _dc_element(tag):
+    """The whole `<dc:x>…</dc:x>` (or `<dc:x/>`) element, with its line's indentation and end."""
+    return re.compile(rf'[ \t]*<{tag}\b[^>]*?(?:/>|>.*?</{tag}>)[ \t]*\n?', re.S)
 
 _TEMPLATE = """<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Tamis">
@@ -78,11 +87,28 @@ def _rejected(text):
     return bool(match) and int(match.group(1)) < 0
 
 
-def read(paths, names):
-    """(rating, label) from the first readable sidecar of any of `paths`, or None.
+def parse_metadata(text):
+    """{"title", "caption", "keywords"} found in XMP text (what is absent is left out); None if none is there."""
+    found = {}
+    for key, tag in _DC_TAGS.items():
+        match = _dc_element(tag).search(text)
+        if match is None:
+            continue
+        items = [(attributes, unescape(value).strip()) for attributes, value in _LI.findall(match.group(0))]
+        if key == "keywords":
+            found[key] = [value for _attributes, value in items if value]
+        else:
+            default = [value for attributes, value in items if "x-default" in attributes]
+            found[key] = (default or [value for _attributes, value in items] or [""])[0]
+    return found or None
+
+
+def read_all(paths, names):
+    """(rating, label, metadata) from the first readable sidecar of any of `paths`, or None.
 
     The rating is None when the sidecar says "rejected": a -1 says nothing about
-    the stars, which Tamis may have replaced with it, see REJECTED_RATING.
+    the stars, which Tamis may have replaced with it, see REJECTED_RATING. The
+    metadata is None when the sidecar has no title, caption or keywords.
     """
     for path in paths:
         for sidecar in _existing(path, names):
@@ -90,10 +116,16 @@ def read(paths, names):
                 with open(sidecar, encoding='utf-8') as file:
                     text = file.read()
                 rating, label = parse(text)
-                return (None if _rejected(text) else rating), label
+                return (None if _rejected(text) else rating), label, parse_metadata(text)
             except (OSError, UnicodeDecodeError, ValueError):
                 continue
     return None
+
+
+def read(paths, names):
+    """(rating, label) from the first readable sidecar of any of `paths`, or None; see read_all()."""
+    found = read_all(paths, names)
+    return None if found is None else found[:2]
 
 
 # -- writing -----------------------------------------------------------------
@@ -119,18 +151,51 @@ def update(text, rating, label):
     return text[:match.end()] + attributes + text[match.end():]
 
 
-def write(paths, rating, label, names):
+def update_metadata(text, data):
+    """`text` with its dc:title, dc:description and dc:subject replaced by those of `data`.
+
+    None if it has nowhere to put them.
+    """
+    for tag in _DC_TAGS.values():
+        text = _dc_element(tag).sub('', text)
+    match = _DESCRIPTION.search(text)
+    if match is None:
+        return None
+    tag_end = text.find('>', match.end())
+    if tag_end == -1:
+        return None
+    elements = ""
+    for key in ("title", "caption"):
+        if data.get(key):
+            tag = _DC_TAGS[key]
+            elements += f'   <{tag}><rdf:Alt><rdf:li xml:lang="x-default">{escape(data[key])}</rdf:li></rdf:Alt></{tag}>\n'
+    if data.get("keywords"):
+        items = "".join(f"<rdf:li>{escape(word)}</rdf:li>" for word in data["keywords"])
+        elements += f"   <dc:subject><rdf:Bag>{items}</rdf:Bag></dc:subject>\n"
+    if not elements:
+        return text
+    opening = text[match.start():tag_end]
+    namespace = f' xmlns:dc="{_DC_NAMESPACE}"' if "xmlns:dc=" not in text[:tag_end] else ""
+    if opening.endswith('/'):  # <rdf:Description …/>: opened up to hold the elements
+        opening = opening[:-1].rstrip()
+        return text[:match.start()] + opening + namespace + ">\n" + elements + "  </rdf:Description>" + text[tag_end + 1:]
+    return text[:match.start()] + opening + namespace + ">\n" + elements + text[tag_end + 1:].lstrip("\n")
+
+
+def write(paths, rating, label, names, metadata=None):
     """Store `rating` / `label` for the photo made of `paths` (a RAW and its JPEG, say).
 
-    Updates every existing sidecar; creates `IMG.xmp` for a RAW that has
-    none, unless there is nothing to store. Raises OSError on failure.
+    With `metadata` (see metadata.clean()), its title, caption and keywords
+    replace the sidecar's; None leaves them alone. Updates every existing
+    sidecar; creates `IMG.xmp` for a RAW that has none, unless there is
+    nothing to store. Raises OSError on failure.
     """
     targets = []
     for path in paths:
         existing = _existing(path, names)
         if existing:
             targets += existing
-        elif is_raw(path) and (rating or label):
+        elif is_raw(path) and (rating or label or metadata):
             name = _candidates(path)[0]
             names[name.lower()] = name
             targets.append(os.path.join(os.path.dirname(path), name))
@@ -144,6 +209,8 @@ def write(paths, rating, label, names):
         except UnicodeDecodeError:
             continue  # not text we understand: leave it alone
         new_text = update(text, rating, label)
+        if new_text is not None and metadata is not None:
+            new_text = update_metadata(new_text, metadata)
         if new_text is None or new_text == text:
             continue
         tmp_path = target + ".tmp"

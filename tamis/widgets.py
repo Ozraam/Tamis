@@ -7,6 +7,7 @@ from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqt
 from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -26,9 +27,12 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QStyle,
     QStyledItemDelegate,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
+from . import keeplists, stego
 from .constants import (
     COLOR_ACCENT,
     COLOR_CARD,
@@ -43,11 +47,26 @@ from .constants import (
     LABEL_COLORS,
     REJECT,
 )
-from .exportsettings import LONG_EDGE_MAX, QUALITY_RANGE, SCOPES, TOKENS, ExportSettings, file_stem, pattern_problem
-from .fileops import import_size, plan_import
+from .exportsettings import (
+    LONG_EDGE_MAX,
+    OPACITY_RANGE,
+    QUALITY_RANGE,
+    SCOPES,
+    TOKENS,
+    WATERMARK_MARGIN_RANGE,
+    WATERMARK_POSITIONS,
+    WATERMARK_SIZE_RANGE,
+    ExportSettings,
+    available_formats,
+    file_stem,
+    pattern_problem,
+    split_keywords,
+)
+from .fileops import atomic_write, import_size, plan_import
 from .models import (
     BURST_ROLE,
     EDITED_ROLE,
+    FACE_ROLE,
     LABEL_ROLE,
     RATING_ROLE,
     SOFT_ROLE,
@@ -226,6 +245,9 @@ class ThumbnailDelegate(QStyledItemDelegate):
             parts.append(f"{'◎ ' if burst.sharpest else ''}{burst.position + 1}/{burst.size}")
         if soft:
             parts.append("soft")
+        face = index.data(FACE_ROLE)
+        if face:
+            parts.append(face)
         if not parts:
             return
         font = option.font
@@ -418,6 +440,16 @@ class GalleryToolbar(QFrame):
     FOCUS = ((StatusFilterProxy.ALL, "Any focus"), (StatusFilterProxy.SHARP, "Looks sharp"), (StatusFilterProxy.SOFT, "Looks soft"))
     SORTS = (("name", "Sort by name"), ("date", "Sort by date"), ("sharpness", "Sort by sharpness"))
 
+    def set_faces(self, on):
+        """Offer the face filter, when faces are looked for."""
+        index = self.focus_combo.findData(StatusFilterProxy.FACES)
+        if on and index == -1:
+            self.focus_combo.addItem("Eyes closed or face soft", StatusFilterProxy.FACES)
+        elif not on and index != -1:
+            if self.focus_combo.currentIndex() == index:
+                self.focus_combo.setCurrentIndex(0)
+            self.focus_combo.removeItem(index)
+
     def __init__(self, initial_size, sort_order="name", bursts=False, parent=None):
         super().__init__(parent)
         self.setObjectName("GalleryToolbar")
@@ -535,8 +567,21 @@ class Toast(QLabel):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.hide)
+        self._on_click = None
 
-    def show_message(self, text, msecs=2200):
+    def mousePressEvent(self, event):
+        if self._on_click is not None and event.button() == Qt.MouseButton.LeftButton:
+            callback, self._on_click = self._on_click, None
+            self.hide()
+            callback()
+            return
+        super().mousePressEvent(event)
+
+    def show_message(self, text, msecs=2200, on_click=None):
+        """Show `text` for `msecs`; with `on_click`, a click on it calls that and hides it."""
+        self._on_click = on_click
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, on_click is None)
+        self.setCursor(Qt.CursorShape.PointingHandCursor if on_click else Qt.CursorShape.ArrowCursor)
         self.setText(text)
         self.adjustSize()
         parent = self.parentWidget()
@@ -681,8 +726,30 @@ class ProcessDialog(MessageDialog):
         return self.export_check is not None and self._can_export and self.export_check.isChecked()
 
 
+def _grid(rows):
+    """A page of `(title, widget or layout)` rows."""
+    page = QWidget()
+    grid = QGridLayout(page)
+    grid.setHorizontalSpacing(8)
+    for row, (title, item) in enumerate(rows):
+        grid.addWidget(QLabel(title), row, 0)
+        if isinstance(item, QHBoxLayout):
+            grid.addLayout(item, row, 1)
+        else:
+            grid.addWidget(item, row, 1)
+    grid.setRowStretch(len(rows), 1)
+    return page
+
+
+def _spin(low, high, suffix=""):
+    spin = QSpinBox()
+    spin.setRange(low, high)
+    spin.setSuffix(suffix)
+    return spin
+
+
 class ExportSettingsDialog(MessageDialog):
-    """Size, quality, destination and names of exports, with named profiles.
+    """Format, size, quality, destination and names of exports, watermark and credits, with named profiles.
 
     Accepted, `settings` is what was chosen. Profiles are saved and deleted
     straight away, through `save_profiles(profiles)`, which may raise OSError.
@@ -712,49 +779,110 @@ class ExportSettingsDialog(MessageDialog):
         browse.clicked.connect(self._browse)
         self.pattern_edit = QLineEdit()
         self.pattern_edit.setToolTip("Fields: " + ", ".join(f"{{{token}}}" for token in TOKENS))
+        self.format_combo = QComboBox()
+        for fmt in available_formats():
+            self.format_combo.addItem(fmt.title, fmt.id)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
+        self.watermark_text = QLineEdit()
+        self.watermark_text.setPlaceholderText("© Your Name")
+        self.watermark_image = QLineEdit()
+        self.watermark_image.setPlaceholderText("A PNG logo, instead of the text")
+        logo_browse = QPushButton("Choose…")
+        logo_browse.clicked.connect(self._browse_logo)
+        self.watermark_position = QComboBox()
+        for position, title in WATERMARK_POSITIONS:
+            self.watermark_position.addItem(title, position)
+        self.watermark_size = _spin(*WATERMARK_SIZE_RANGE, " % of the long edge")
+        self.watermark_size.setToolTip("Width of the watermark")
+        self.watermark_margin = _spin(*WATERMARK_MARGIN_RANGE, " % of the long edge")
+        self.watermark_opacity = _spin(*OPACITY_RANGE, " %")
+        self.hidden_mark = QLineEdit()
+        self.hidden_mark.setPlaceholderText("Invisible: a short text written into the pixels")
+        self.hidden_mark.setToolTip(
+            "Survives saving as JPEG, not resizing or cropping. Options ▾ › Read a Hidden Mark… reads it back."
+        )
+
+        self.creator = QLineEdit()
+        self.copyright = QLineEdit()
+        self.copyright.setPlaceholderText("© 2026 Your Name")
+        self.contact = QLineEdit()
+        self.contact.setPlaceholderText("E-mail or website")
+        self.keywords = QLineEdit()
+        self.keywords.setPlaceholderText("Separated by commas, added to each photo's own")
+
         profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profile"))
         profile_row.addWidget(self.profile_combo, 1)
         profile_row.addWidget(self.save_profile_button)
         profile_row.addWidget(self.delete_profile_button)
         folder_row = QHBoxLayout()
         folder_row.addWidget(self.folder_edit, 1)
         folder_row.addWidget(browse)
-        rows = (
-            ("Profile", profile_row),
+        logo_row = QHBoxLayout()
+        logo_row.addWidget(self.watermark_image, 1)
+        logo_row.addWidget(logo_browse)
+        self.pages = QTabWidget()
+        self.pages.addTab(_grid((
+            ("Format", self.format_combo),
             ("Long edge", self.long_edge),
             ("Quality", self.quality),
             ("Folder", folder_row),
             ("Name", self.pattern_edit),
-        )
-        for row, (title, item) in enumerate(rows):
-            grid.addWidget(QLabel(title), row, 0)
-            if isinstance(item, QHBoxLayout):
-                grid.addLayout(item, row, 1)
-            else:
-                grid.addWidget(item, row, 1)
-        self.layout().insertLayout(1, grid)  # under the heading, above the summary
+        )), "Output")
+        self.pages.addTab(_grid((
+            ("Text", self.watermark_text),
+            ("Logo", logo_row),
+            ("Position", self.watermark_position),
+            ("Size", self.watermark_size),
+            ("Margin", self.watermark_margin),
+            ("Opacity", self.watermark_opacity),
+            ("Hidden mark", self.hidden_mark),
+        )), "Watermark")
+        self.pages.addTab(_grid((
+            ("Creator", self.creator),
+            ("Copyright", self.copyright),
+            ("Contact", self.contact),
+            ("Keywords", self.keywords),
+        )), "Credits")
+        layout = self.layout()
+        layout.insertLayout(1, profile_row)  # under the heading, above the summary
+        layout.insertWidget(2, self.pages)
 
         self._fill_profiles()
         self._show(settings)
         self.profile_combo.activated.connect(self._on_profile_chosen)
         self.save_profile_button.clicked.connect(self._save_profile)
         self.delete_profile_button.clicked.connect(self._delete_profile)
-        for spin in (self.long_edge, self.quality):
+        for spin in (self.long_edge, self.quality, self.watermark_size, self.watermark_margin, self.watermark_opacity):
             spin.valueChanged.connect(self._update)
-        for edit in (self.folder_edit, self.pattern_edit):
+        for edit in (
+            self.folder_edit, self.pattern_edit, self.watermark_text, self.watermark_image, self.hidden_mark,
+            self.creator, self.copyright, self.contact, self.keywords,
+        ):
             edit.textChanged.connect(self._update)
+        for combo in (self.format_combo, self.watermark_position):
+            combo.currentIndexChanged.connect(self._update)
         self._update()
 
     @property
     def settings(self):
         return ExportSettings(
-            self.long_edge.value(),
-            self.quality.value(),
-            self.folder_edit.text().strip() or EXPORT_DIR,
-            self.pattern_edit.text().strip(),
+            long_edge=self.long_edge.value(),
+            quality=self.quality.value(),
+            folder=self.folder_edit.text().strip() or EXPORT_DIR,
+            pattern=self.pattern_edit.text().strip(),
+            format=self.format_combo.currentData() or "jpeg",
+            watermark_text=self.watermark_text.text().strip(),
+            watermark_image=self.watermark_image.text().strip(),
+            watermark_position=self.watermark_position.currentData(),
+            watermark_size=self.watermark_size.value(),
+            watermark_margin=self.watermark_margin.value(),
+            watermark_opacity=self.watermark_opacity.value(),
+            hidden_mark=self.hidden_mark.text().strip(),
+            creator=self.creator.text().strip(),
+            copyright=self.copyright.text().strip(),
+            contact=self.contact.text().strip(),
+            keywords=self.keywords.text().strip(),
         )
 
     def _show(self, settings):
@@ -762,6 +890,20 @@ class ExportSettingsDialog(MessageDialog):
         self.quality.setValue(settings.quality)
         self.folder_edit.setText(settings.folder)
         self.pattern_edit.setText(settings.pattern)
+        if self.format_combo.findData(settings.format) == -1:  # a profile made where Qt could write it
+            self.format_combo.addItem(settings.file_format.title + " (not available here)", settings.format)
+        self.format_combo.setCurrentIndex(self.format_combo.findData(settings.format))
+        self.watermark_text.setText(settings.watermark_text)
+        self.watermark_image.setText(settings.watermark_image)
+        self.watermark_position.setCurrentIndex(self.watermark_position.findData(settings.watermark_position))
+        self.watermark_size.setValue(settings.watermark_size)
+        self.watermark_margin.setValue(settings.watermark_margin)
+        self.watermark_opacity.setValue(settings.watermark_opacity)
+        self.hidden_mark.setText(settings.hidden_mark)
+        self.creator.setText(settings.creator)
+        self.copyright.setText(settings.copyright)
+        self.contact.setText(settings.contact)
+        self.keywords.setText(settings.keywords)
 
     def _fill_profiles(self):
         self.profile_combo.clear()
@@ -805,10 +947,21 @@ class ExportSettingsDialog(MessageDialog):
         if folder:
             self.folder_edit.setText(folder)
 
+    def _browse_logo(self):
+        start = os.path.dirname(os.path.expanduser(self.watermark_image.text())) or os.path.expanduser("~")
+        path, _filter = QFileDialog.getOpenFileName(self, "Watermark logo", start, "Images (*.png *.svg *.tif *.tiff *.jpg)")
+        if path:
+            self.watermark_image.setText(path)
+
     def _problem(self):
         problem = pattern_problem(self.pattern_edit.text())
         if problem is None and self.shoot_folder:
             problem = self.settings.problem(self.shoot_folder)
+        logo = os.path.expanduser(self.watermark_image.text().strip())
+        if problem is None and logo and not os.path.isfile(logo):
+            problem = "The watermark logo can't be found."
+        if problem is None:
+            problem = stego.problem(self.hidden_mark.text().strip())
         return problem
 
     def _update(self):
@@ -821,12 +974,17 @@ class ExportSettingsDialog(MessageDialog):
             self.body.setText(f"<b>{escape(problem)}</b>")
             return
         settings = self.settings
+        self.quality.setEnabled(settings.file_format.quality)
         example = file_stem(settings.pattern, "IMG_0042", "2026-05-17", 7, 120, "Wedding")
+        if settings.copies_jpegs:
+            copies = "Unedited JPEGs are copied as they are (with your credits); "
+        else:
+            copies = "Every photo is rendered, unedited JPEGs included; "
+        exif = "carry the original's EXIF and an sRGB profile." if settings.format == "jpeg" else "have an sRGB profile."
         self.body.setText(
-            f"For example: IMG_0042 → <b>{escape(example)}.jpg</b>"
+            f"For example: IMG_0042 → <b>{escape(example)}{settings.extension}</b>"
             "<br>Fields: " + ", ".join(f"{{{token}}}" for token in TOKENS) + " ({seq} counts the photos of one export)."
-            "<br>Unedited JPEGs are copied as they are unless they need resizing; rendered ones "
-            "carry the original's EXIF and an sRGB profile."
+            f"<br>{copies}rendered ones {exif}"
         )
 
 
@@ -925,6 +1083,180 @@ class ImportDialog(MessageDialog):
                 f"<b>{len(self.groups)}</b> photo(s), {size_text(self.size)}. Every copy is read back and "
                 "compared with the original, files already there are skipped, and nothing on the card changes."
             )
+
+
+class AboutDialog(MessageDialog):
+    """The version, what it runs on, and whether a newer version is out.
+
+    `check()` is called by **Check for Updates Now**; the result comes back
+    through `set_update(text)`.
+    """
+
+    def __init__(self, parent, title, text, update_text="", check=None):
+        super().__init__(parent, title, text)
+        self.body.setOpenExternalLinks(True)
+        self.update_label = QLabel(update_text)
+        self.update_label.setWordWrap(True)
+        self.update_label.setTextFormat(Qt.TextFormat.RichText)
+        self.update_label.setOpenExternalLinks(True)
+        self.update_label.setVisible(bool(update_text))
+        layout = self.layout()
+        layout.insertWidget(layout.count() - 1, self.update_label)
+        self.check_button = None
+        if check is not None:
+            self.check_button = QPushButton("Check for Updates Now")
+            self.check_button.clicked.connect(self._check)
+            layout.itemAt(layout.count() - 1).widget().addButton(self.check_button, QDialogButtonBox.ButtonRole.ActionRole)
+        self._check_callback = check
+
+    def _check(self):
+        self.check_button.setEnabled(False)
+        self.set_update("Checking…")
+        self._check_callback()
+
+    def set_update(self, text):
+        self.update_label.setText(text)
+        self.update_label.setVisible(bool(text))
+        if self.check_button is not None and text != "Checking…":
+            self.check_button.setEnabled(True)
+
+
+class MetadataDialog(MessageDialog):
+    """Title, caption and keywords of one photo or several.
+
+    `values` is the metadata of each photo (see metadata.clean()). A field
+    that differs between them says so, and is left alone unless typed in.
+    Accepted, `changes` holds the fields to set ({} for none), keywords as a list.
+    """
+
+    def __init__(self, parent, values):
+        count = len(values)
+        super().__init__(parent, "Title, caption and keywords", "", confirm_text="Save")
+        self.setMinimumWidth(520)
+        self.body.setText(
+            (f"For <b>{count}</b> photos. " if count > 1 else "")
+            + "Written to the photo's XMP sidecar (Lightroom's Title, Caption and Keywords) and into its exports."
+        )
+        self.title_edit = QLineEdit()
+        self.caption_edit = QPlainTextEdit()
+        self.caption_edit.setTabChangesFocus(True)
+        self.caption_edit.setFixedHeight(80)
+        self.keywords_edit = QLineEdit()
+        self.keywords_edit.setToolTip("Separated by commas")
+        self._initial = {}
+        for key, widget in (("title", self.title_edit), ("caption", self.caption_edit), ("keywords", self.keywords_edit)):
+            texts = {", ".join(value.get(key, [])) if key == "keywords" else value.get(key, "") for value in values}
+            text = texts.pop() if len(texts) == 1 else None
+            self._initial[key] = text
+            if text is None:
+                widget.setPlaceholderText("Several values: left as they are unless you type here")
+            elif widget is self.caption_edit:
+                widget.setPlainText(text)
+            else:
+                widget.setText(text)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        for row, (title, widget) in enumerate((("Title", self.title_edit), ("Caption", self.caption_edit),
+                                                ("Keywords", self.keywords_edit))):
+            grid.addWidget(QLabel(title), row, 0, Qt.AlignmentFlag.AlignTop)
+            grid.addWidget(widget, row, 1)
+        self.layout().insertLayout(2, grid)
+
+    def _text(self, key):
+        widget = {"title": self.title_edit, "caption": self.caption_edit, "keywords": self.keywords_edit}[key]
+        return (widget.toPlainText() if widget is self.caption_edit else widget.text()).strip()
+
+    @property
+    def changes(self):
+        changes = {}
+        for key in ("title", "caption", "keywords"):
+            text = self._text(key)
+            initial = self._initial[key]
+            if (initial is None and not text) or text == (initial or "").strip():
+                continue  # several values left alone, or nothing changed
+            changes[key] = split_keywords(text) if key == "keywords" else text
+        return changes
+
+
+class KeepsListDialog(MessageDialog):
+    """The names of the keeps (or of the photos the Gallery shows), in a form another editor accepts.
+
+    `choices` is [(id, title, photos)] of the sets of photos to list; `folder`
+    is where Save offers to write the list. Copy puts it on the clipboard.
+    """
+
+    def __init__(self, parent, choices, folder):
+        super().__init__(parent, "List of keeps for other editors", "", confirm_text="Copy")
+        self.setMinimumWidth(560)
+        self.folder = folder
+        self.saved = None  # where Save wrote the list
+        self.which_combo = QComboBox()
+        for choice_id, title, photos in choices:
+            self.which_combo.addItem(f"{title} ({len(photos)})", (choice_id, photos))
+        self.format_combo = QComboBox()
+        for format_id, title, _ext in keeplists.FORMATS:
+            self.format_combo.addItem(title, format_id)
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setMinimumHeight(120)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.addWidget(QLabel("Photos"), 0, 0)
+        grid.addWidget(self.which_combo, 0, 1)
+        grid.addWidget(QLabel("Format"), 1, 0)
+        grid.addWidget(self.format_combo, 1, 1)
+        layout = self.layout()
+        layout.insertLayout(1, grid)
+        layout.insertWidget(layout.count() - 1, self.preview)
+        self.save_button = QPushButton("Save…")
+        self.save_button.clicked.connect(self._save)
+        layout.itemAt(layout.count() - 1).widget().addButton(self.save_button, QDialogButtonBox.ButtonRole.ActionRole)
+
+        self.which_combo.currentIndexChanged.connect(self._update)
+        self.format_combo.currentIndexChanged.connect(self._update)
+        self.accepted.connect(lambda: QApplication.clipboard().setText(self.text))
+        self._update()
+
+    @property
+    def format_id(self):
+        return self.format_combo.currentData()
+
+    @property
+    def which(self):
+        return self.which_combo.currentData()
+
+    @property
+    def text(self):
+        return keeplists.text(self.which[1], self.format_id, self.folder)
+
+    def _update(self):
+        photos = self.which[1] if self.which else []
+        self.preview.setPlainText(self.text if photos else "")
+        self.confirm_button.setEnabled(bool(photos))
+        self.save_button.setEnabled(bool(photos))
+        hints = {
+            "lightroom": "In Lightroom Classic's Library filter, choose <b>Text › Filename › Contains</b> and paste: "
+            "the photos of any of these names show (RAW and JPEG alike).",
+            "lines": "One file name per line, a pair's RAW and JPEG both listed.",
+            "csv": "One row per file, with its mark, stars and colour label, for a spreadsheet or a script.",
+        }
+        self.body.setText(hints[self.format_id])
+
+    def _save(self):
+        which = self.which[0]
+        start = os.path.join(self.folder or os.path.expanduser("~"), keeplists.default_name(self.folder, self.format_id, which))
+        path, _filter = QFileDialog.getSaveFileName(self, "Save the list", start)
+        if not path:
+            return
+        try:
+            with atomic_write(path) as tmp_path, open(tmp_path, "w", encoding="utf-8", newline="") as file:
+                file.write(self.text)
+        except OSError as exc:
+            inform(self, "The list could not be saved", escape(exc.strerror or str(exc)))
+            return
+        self.saved = path
+        self.reject()  # saved: nothing left to do
 
 
 def inform(parent, title, text, details=None):
