@@ -46,7 +46,14 @@ _SECTIONS = (
 )
 
 
-class _Slider(QSlider):
+class _ScrollsPanel:
+    """Leaves the wheel to the panel's scroll area, so scrolling over a control never changes it."""
+
+    def wheelEvent(self, event):
+        event.ignore()  # passes the event on to the parent, which ends at the scroll area
+
+
+class _Slider(_ScrollsPanel, QSlider):
     """A slider that goes back to its default on double-click."""
 
     def __init__(self, default, parent=None):
@@ -59,7 +66,11 @@ class _Slider(QSlider):
         self.sliderReleased.emit()  # a deliberate change: commit it
 
 
-class _LutCombo(QComboBox):
+class _Combo(_ScrollsPanel, QComboBox):
+    """A combo box the wheel doesn't change."""
+
+
+class _LutCombo(_Combo):
     """A combo box whose popup is a menu tree following the LUT folder's sub-folders.
 
     Items stay a flat list (text: display name, data: LUT id like "Fuji/Velvia 50.png");
@@ -394,7 +405,7 @@ class EditPanel(QFrame):
     def _crop_row(self):
         self.crop_button = self._button("Crop", self.crop_requested)
         self.crop_button.setToolTip("Crop this photo (R)")
-        self.crop_ratio = QComboBox()
+        self.crop_ratio = _Combo()
         self.crop_ratio.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.crop_ratio.setToolTip("Shape of the crop frame")
         for label, ratio in CROP_RATIOS:
@@ -510,7 +521,7 @@ class EditPanel(QFrame):
         value = slider.value() / scale
         self._values[key].setText(_format(key, value if key in ("exposure", "straighten") else int(value)))
         if not self._updating:
-            # Dragging previews; a click on the track or the wheel is a final change.
+            # Dragging previews; a click on the track is a final change.
             self.changed.emit(self.edit(), not slider.isSliderDown())
 
     def _update_process(self):

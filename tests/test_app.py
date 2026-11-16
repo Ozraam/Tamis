@@ -10,7 +10,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, QSize, Qt, QTimer  # noqa: E402
-from PyQt6.QtGui import QColor, QImage, QKeySequence, QPixmap  # noqa: E402
+from PyQt6.QtGui import QColor, QImage, QKeySequence, QPixmap, QWheelEvent  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog, QProgressDialog, QPushButton  # noqa: E402
 from rawfiles import write_dng  # noqa: E402
@@ -1863,6 +1863,25 @@ def test_straighten_slider_goes_into_the_edit(window):
     slider.setValue(25)
     assert window.model.photo(0).edit == {"straighten": 2.5}
     assert window.edit_panel._values["straighten"].text() == "+2.5°"
+
+
+def test_the_wheel_over_edit_controls_is_left_to_the_panel(window):
+    # An ignored wheel event goes on to the parents, up to the panel's scroll area (Qt only
+    # propagates real ones, so the test checks the controls leave it alone).
+    window.toggle_edit_panel()
+    panel = window.edit_panel
+    slider, _scale = panel._sliders["contrast"]
+    before = slider.value(), panel.crop_ratio.currentIndex(), panel.lut_combo.currentIndex()
+    for control in (slider, panel.crop_ratio, panel.lut_combo):
+        center = QPointF(control.rect().center())
+        event = QWheelEvent(
+            center, QPointF(control.mapToGlobal(center.toPoint())), QPoint(), QPoint(0, -120),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        QApplication.sendEvent(control, event)
+        assert not event.isAccepted()
+    assert (slider.value(), panel.crop_ratio.currentIndex(), panel.lut_combo.currentIndex()) == before
+    assert window.model.photo(0).edit == {}
 
 
 def test_copying_leaves_turns_and_straightening_behind(window):
