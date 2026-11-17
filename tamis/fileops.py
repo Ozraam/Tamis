@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from PyQt6.QtCore import QFile
 
 from . import exif, exportsettings, metadata
-from .constants import EXPORT_DIR, KEEP, KEEP_DIR, REJECT, REJECT_DIR, SUPPORTED_EXTENSIONS, is_raw
+from .constants import EXPORT_DIR, KEEP, KEEP_DIR, REJECT, REJECT_DIR, SUPPORTED_EXTENSIONS, copy_number, file_of, is_raw
 
 
 @dataclass
@@ -43,11 +43,25 @@ def target_dir(folder, status):
     return folder
 
 
+def file_marks(photos):
+    """{file: the mark its files are sorted by}: its photo's, or keep when a virtual copy of it is kept."""
+    marks = {photo.path: photo.status for photo in photos if not copy_number(photo.path)}
+    for photo in photos:
+        if copy_number(photo.path) and photo.status == KEEP and file_of(photo.path) in marks:
+            marks[file_of(photo.path)] = KEEP
+    return marks
+
+
 def plan_moves(folder, photos):
+    """Where the files of `photos` go: each photo's to the folder of its mark (see file_marks()).
+
+    Virtual copies have no files of their own: their photo's go where the marks of all of them say.
+    """
+    marks = file_marks(photos)
     return [
-        Move(photo.path, target_dir(folder, photo.status), photo.status, list(photo.companions))
+        Move(photo.path, target_dir(folder, marks[photo.path]), marks[photo.path], list(photo.companions))
         for photo in photos
-        if photo.status != photo.location
+        if not copy_number(photo.path) and marks[photo.path] != photo.location
     ]
 
 
@@ -170,7 +184,7 @@ JPEG_EXTENSIONS = frozenset({'.jpg', '.jpeg'})
 
 
 def is_jpeg(path):
-    return os.path.splitext(path)[1].lower() in JPEG_EXTENSIONS
+    return os.path.splitext(file_of(path))[1].lower() in JPEG_EXTENSIONS
 
 
 def jpeg_file(photo):
@@ -207,11 +221,13 @@ def plan_exports(photos, keeps_only=False, pattern="{name}", folder_name="", ext
     for photo in photos:
         if photo.status not in wanted:
             continue
-        if photo.edit:
-            chosen.append((photo, photo.path, os.path.splitext(photo.name)[0], extension))
+        number = copy_number(photo.path)
+        suffix = f"-{number}" if number else ""  # a virtual copy's: IMG_1-2.jpg
+        if photo.edit or (number and extension != ".jpg"):
+            chosen.append((photo, photo.path, os.path.splitext(photo.name)[0] + suffix, extension))
         elif (jpeg := jpeg_file(photo)) is not None:
             stem, ext = os.path.splitext(os.path.basename(jpeg))
-            chosen.append((photo, jpeg, stem, ext if extension == ".jpg" else extension))
+            chosen.append((photo, jpeg, stem + suffix, ext if extension == ".jpg" else extension))
 
     jobs, taken = [], set()
 
@@ -350,8 +366,15 @@ class TrashResult:
 
 
 def plan_trash(photos):
-    """The photos sitting in _REJECTS and still marked reject: a photo marked otherwise since is on its way out."""
-    return [photo for photo in photos if photo.location == REJECT and photo.status == REJECT]
+    """The photos sitting in _REJECTS and still marked reject: a photo marked otherwise since is on its way out.
+
+    A photo with a virtual copy that isn't rejected stays, and virtual copies have no files of their own to trash.
+    """
+    kept = {file_of(photo.path) for photo in photos if copy_number(photo.path) and photo.status != REJECT}
+    return [
+        photo for photo in photos
+        if photo.location == REJECT and photo.status == REJECT and not copy_number(photo.path) and photo.path not in kept
+    ]
 
 
 def _photo_group(photo):

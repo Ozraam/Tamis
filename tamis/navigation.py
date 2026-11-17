@@ -43,6 +43,8 @@ class NavigationMixin:
         self.loader.ensure_previews(photo.path, [self.model.photo(r).path for r in dict.fromkeys(others)])
         self.live_edit = None
         self.edit_panel.set_edit(photo.edit, is_raw(photo.path))
+        self._show_advanced(photo)
+        self._after_photo_change()
         self._refresh_view()
         if moved_on:
             self.plugins.emit("photo_changed", PhotoInfo.of(photo))

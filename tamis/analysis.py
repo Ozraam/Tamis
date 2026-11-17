@@ -14,7 +14,7 @@ from contextlib import suppress
 import numpy as np
 from PyQt6.QtCore import QObject, QThread, QThreadPool, pyqtSignal
 
-from .constants import ANALYSIS_MAX_SIZE
+from .constants import ANALYSIS_MAX_SIZE, file_of
 from .exif import capture_time
 from .imaging import gray_array, load_image
 from .models import write_json
@@ -77,10 +77,10 @@ def faces_from_json(value):
 def file_key(path):
     """What a result is valid for, None if the file can't be read."""
     try:
-        stat = os.stat(path)
+        stat = os.stat(file_of(path))
     except OSError:
         return None
-    return f"{os.path.basename(path)}|{stat.st_size}|{stat.st_mtime_ns}"
+    return f"{os.path.basename(file_of(path))}|{stat.st_size}|{stat.st_mtime_ns}"
 
 
 class PhotoAnalyzer(QObject):

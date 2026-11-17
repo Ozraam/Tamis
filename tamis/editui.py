@@ -46,11 +46,13 @@ class EditingMixin:
         if self.before and not self.cropping:
             if not develops:
                 return None  # the preview any unedited photo shows, which _framed() keeps in its frame
-            edit = develop.own(edit)  # the development, framed, without the look
+            edit = develop.unedited(edit)  # the development, framed, without the look
         if self.cropping:
             edit = {key: value for key, value in edit.items() if key != "crop"}
-        if not edit and not develops:
+        if not edit and not develops and not (self.edit_view and self.edit_panel.isVisible()):
             return None
+        if self.edit_view and self.edit_panel.isVisible() and not self.cropping:
+            edit = {**edit, "_view": self.edit_view}  # what to show instead of the photo (see develop.render())
         return edit
 
     def _edited_pixmap(self, photo):
@@ -155,6 +157,8 @@ class EditingMixin:
 
     def toggle_edit_panel(self):
         visible = not self.edit_panel.isVisible()
+        if not visible and self.edit_tool:
+            self.set_edit_tool("")
         self.edit_panel.setVisible(visible)
         self.settings.setValue("edit_panel", visible)
         if visible:
@@ -183,12 +187,14 @@ class EditingMixin:
             QApplication.restoreOverrideCursor()
         exposure = edit.get("exposure", 0.0) + shift
         self.live_edit = None
-        self._set_edit([self.current_row], develop.clean({**edit, "process": develop.PROCESS, "exposure": exposure}))
+        self._set_edit([self.current_row], develop.clean({**edit, "process": develop.PROCESS, "exposure": exposure}),
+                       "New development")
         self.toast.show_message(f"New development · exposure {shift:+.2f} EV, to keep the photo as bright")
 
     def _show_edit_in_panel(self):
         photo = self.model.photo(self.current_row)
         self.edit_panel.set_edit(photo.edit, is_raw(photo.path))
+        self._show_advanced(photo)
 
     def _on_edit_changed(self, edit, final):
         if self.current_row < 0:
@@ -201,19 +207,27 @@ class EditingMixin:
             self.live_edit = (photo.path, edit)
         self._refresh_view()
 
-    def _set_edit(self, rows, edit):
-        self._set_edits({row: dict(edit) for row in rows})
+    def _set_edit(self, rows, edit, label=None):
+        self._set_edits({row: dict(edit) for row in rows}, label)
 
-    def _set_edits(self, values):
-        """Give each row its own edit, as one undo step: `values` is {row: edit}."""
+    def _set_edits(self, values, label=None, record=True):
+        """Give each row its own edit, as one undo step: `values` is {row: edit}.
+
+        With `record`, each change goes into the photo's history, as `label` (worked out when None).
+        """
+        if record:
+            for row, edit in values.items():
+                old = self.model.photo(row).edit
+                if old != edit:
+                    self._record_history(row, old, edit, label)
         self._push_undo(self.model.set_values("edit", values))
         for row, edit in values.items():
             if not edit:
                 self.editor.forget(self.model.photo(row).path)
 
-    def _apply_look(self, rows, look):
+    def _apply_look(self, rows, look, label=None):
         """Give `rows` this look. Each photo keeps its own framing and process."""
-        self._set_edits({row: develop.clean({**look, **develop.own(self.model.photo(row).edit)}) for row in rows})
+        self._set_edits({row: develop.clean({**look, **develop.own(self.model.photo(row).edit)}) for row in rows}, label)
 
     def copy_edit(self):
         """Copy the current photo's look. Its framing belongs to that photo: it is not copied."""
@@ -227,14 +241,14 @@ class EditingMixin:
         if self.edit_clipboard is None:
             self.toast.show_message("Nothing to paste: copy an edit first")
         elif rows:
-            self._apply_look(rows, self.edit_clipboard)
+            self._apply_look(rows, self.edit_clipboard, "Paste")
             self.toast.show_message(f"Edit pasted on {len(rows)} photo(s)")
 
     def reset_edit(self):
         self._finish_crop(apply=False)
         rows = self._target_rows()
         if rows:
-            self._set_edit(rows, {})
+            self._set_edit(rows, {}, "Reset")
 
     # -- presets -----------------------------------------------------------
 
@@ -262,7 +276,7 @@ class EditingMixin:
         look = self.presets.get(name)
         rows = self._target_rows()
         if look is not None and rows:
-            self._apply_look(rows, look)
+            self._apply_look(rows, look, f"Preset {name}")
             self.toast.show_message(f"“{name}” applied to {len(rows)} photo(s)")
 
     def delete_preset(self, name):
@@ -288,7 +302,8 @@ class EditingMixin:
         self._finish_crop(apply=True)
         rows = self._target_rows()
         if rows:
-            self._set_edits({row: develop.turned(self.model.photo(row).edit, degrees) for row in rows})
+            self._set_edits({row: develop.turned(self.model.photo(row).edit, degrees) for row in rows},
+                            "Rotate left" if degrees < 0 else "Rotate right")
 
     # -- crop --------------------------------------------------------------
 
@@ -300,6 +315,8 @@ class EditingMixin:
         if self.current_row < 0:
             return
         self._end_compare()
+        if self.edit_tool:
+            self.set_edit_tool("")
         self.tabs.setCurrentIndex(CULL_TAB)
         if not self.edit_panel.isVisible():
             self.toggle_edit_panel()  # the frame's shape is chosen there
@@ -322,7 +339,7 @@ class EditingMixin:
         self.edit_panel.set_cropping(False)
         if apply and self.current_row >= 0:
             edit = {**self.model.photo(self.current_row).edit, "crop": frame}
-            self._set_edit([self.current_row], develop.clean(edit))
+            self._set_edit([self.current_row], develop.clean(edit), "Crop")
         self._refresh_view()
 
     def _confirm_crop(self):
@@ -337,7 +354,8 @@ class EditingMixin:
             self.image_view.set_crop_frame(cropping.FULL)
         elif self.current_row >= 0:
             edit = self.model.photo(self.current_row).edit
-            self._set_edit([self.current_row], develop.clean({key: value for key, value in edit.items() if key != "crop"}))
+            self._set_edit([self.current_row], develop.clean({key: value for key, value in edit.items() if key != "crop"}),
+                           "Crop cleared")
 
     def _on_crop_ratio_changed(self):
         if self.cropping:

@@ -2,12 +2,17 @@
 
 Input is linear RGB (sRGB primaries) as float32. In order:
 
-- linear: white balance, exposure, shadows / highlights;
-- display (sRGB-encoded): contrast, saturation, film simulation LUT,
-  vignette, grain.
+- linear: white balance, exposure, lens vignetting; then the settings that read
+  a pixel's neighbourhood (local.py: noise reduction, dehaze, texture, clarity,
+  sharpening, defringe); then local adjustments' exposure and white balance,
+  shadows / highlights;
+- display (sRGB-encoded): the tone table (whites / blacks, contrast, tone curves),
+  saturation, vibrance and the HSL mixer, black and white, colour grading,
+  film simulation LUT, vignette, grain.
 
-Every step depends only on a pixel and its position in the full image, so
-a large image can be processed in strips (export) with the same result.
+Every per-pixel step depends only on a pixel and its position in the full image,
+and the neighbourhood ones on rows no further than local.margin(), so a large
+image can be processed in strips (export) with the same result.
 An edit is a plain dict holding only the settings that differ from
 DEFAULTS, which is also how it is stored in the session.
 
@@ -15,10 +20,13 @@ The framing (quarter turns, straightening, then the crop, which is in
 fractions of the turned picture) is applied before all of this, so the vignette
 and the grain follow the final frame: render() is given the framed pixels.
 """
+import functools
+import json
 import math
 
 import numpy as np
 
+from . import colours, curves, lenses, local, masks, spots
 from .lut import apply as apply_lut
 
 MIN_CROP_SIZE = 0.005  # smallest stored crop side, as a fraction of the photo's
@@ -41,6 +49,44 @@ DEFAULTS = {
     "vignette": 0,  # negative darkens the corners
     # How a RAW is developed (see PROCESS); edits made before process 2 keep 1, so they keep their look.
     "process": 2,
+    # -- Advanced: what the edit panel's Advanced tab sets.
+    "whites": 0,
+    "blacks": 0,
+    "vibrance": 0,
+    **{key: 0 for key in colours.HSL_KEYS},  # hue_red, sat_red, lum_red, …
+    "bw": 0,  # 1: black and white, mixed by bw_red, bw_orange, …
+    **{key: 0 for key in colours.BW_KEYS},
+    **{key: 0 for key in colours.GRADE_KEYS},  # grade_shadows_hue, grade_shadows_sat, grade_shadows_lum, …
+    "grade_balance": 0,
+    "grade_blending": 50,
+    "curve_shadows": 0,
+    "curve_darks": 0,
+    "curve_lights": 0,
+    "curve_highlights": 0,
+    "curve_split1": 25,
+    "curve_split2": 50,
+    "curve_split3": 75,
+    "curve": None,  # point curves, see curves.py
+    "texture": 0,
+    "clarity": 0,
+    "dehaze": 0,
+    "sharpen": None,  # None: local.SHARPEN_RAW for RAWs, none otherwise
+    "sharpen_radius": 1.0,
+    "sharpen_detail": 25,
+    "sharpen_masking": 0,
+    "nr_luma": 0,
+    "nr_color": None,  # None: local.NR_COLOR_RAW for RAWs, none otherwise
+    "defringe": 0,
+    "lens_profile": 0,  # 1: corrections from the lens's profile (lenses.py)
+    "lens_distortion": 100,  # how much of the profile's corrections, in %
+    "lens_vignetting": 100,
+    "distortion": 0,  # by hand: positive straightens barrel distortion
+    "devignette": 0,  # by hand: positive brightens the corners the lens darkened
+    "ca_red": 0,  # lateral chromatic aberration: red and blue scaled about the centre
+    "ca_blue": 0,
+    "profile": None,  # how a RAW's colours are rendered, see profiles.py; None: the standard matrix
+    "masks": None,  # local adjustments, see masks.py
+    "spots": None,  # removed spots, see spots.py
 }
 RANGES = {
     "straighten": (-15.0, 15.0),
@@ -56,12 +102,59 @@ RANGES = {
     "grain_size": (1, 3),
     "vignette": (-100, 100),
     "process": (1, 2),
+    "whites": (-100, 100),
+    "blacks": (-100, 100),
+    "vibrance": (-100, 100),
+    **{key: (-100, 100) for key in colours.HSL_KEYS},
+    "bw": (0, 1),
+    **{key: (-100, 100) for key in colours.BW_KEYS},
+    **{key: (0, 360) if key.endswith("_hue") else (0, 100) if key.endswith("_sat") else (-100, 100)
+       for key in colours.GRADE_KEYS},
+    "grade_balance": (-100, 100),
+    "grade_blending": (0, 100),
+    "curve_shadows": (-100, 100),
+    "curve_darks": (-100, 100),
+    "curve_lights": (-100, 100),
+    "curve_highlights": (-100, 100),
+    "curve_split1": (5, 45),
+    "curve_split2": (30, 70),
+    "curve_split3": (55, 95),
+    "texture": (-100, 100),
+    "clarity": (-100, 100),
+    "dehaze": (-100, 100),
+    "sharpen": (0, 150),
+    "sharpen_radius": (0.5, 3.0),
+    "sharpen_detail": (0, 100),
+    "sharpen_masking": (0, 100),
+    "nr_luma": (0, 100),
+    "nr_color": (0, 100),
+    "defringe": (0, 100),
+    "lens_profile": (0, 1),
+    "lens_distortion": (0, 200),
+    "lens_vignetting": (0, 200),
+    "distortion": (-100, 100),
+    "devignette": (-100, 100),
+    "ca_red": (-100, 100),
+    "ca_blue": (-100, 100),
 }
+FLOATS = {"exposure": 2, "straighten": 1, "sharpen_radius": 1}  # settings with decimals, and how many
+# Settings that aren't numbers, and how they are cleaned.
+_CLEANERS = {"curve": curves.clean, "masks": masks.clean, "spots": spots.clean}
+
+# The settings of the Advanced tab: an edit using any of them says so on the tab.
+BASIC = (
+    "crop", "rotate", "straighten", "exposure", "temperature", "tint", "contrast", "highlights", "shadows",
+    "saturation", "lut", "lut_strength", "grain", "grain_size", "vignette", "process",
+)
+ADVANCED = tuple(key for key in DEFAULTS if key not in BASIC)
 
 # What belongs to one photo's framing: not part of its look, so neither copied nor kept in a preset.
 FRAMING = ("crop", "rotate", "straighten")
-# What belongs to one photo, its framing and how it is developed: what copy, paste and presets leave alone.
-OWN = (*FRAMING, "process")
+# What belongs to one photo, its framing and how it is developed, and what is drawn on it (local adjustments,
+# removed spots): what copy, paste and presets leave alone.
+OWN = (*FRAMING, "process", "masks", "spots")
+# What the "before" view keeps: the photo as developed and framed, without anything that changes its look.
+UNEDITED = (*FRAMING, "process")
 
 # How RAWs are developed. 1: LibRaw's automatic brightness, which clips the brightest 1%
 # and differs from photo to photo. 2: no automatic brightness and blended highlights,
@@ -121,6 +214,16 @@ def look(edit):
 def own(edit):
     """Only what of `edit` belongs to its photo: its framing and how it is developed."""
     return {key: edit[key] for key in OWN if key in edit}
+
+
+def unedited(edit):
+    """`edit` without what changes the photo's look: its development, framed, for the "before" view."""
+    return {key: edit[key] for key in UNEDITED if key in edit}
+
+
+def advanced(edit):
+    """Whether `edit` uses any setting of the Advanced tab."""
+    return any(key in edit for key in ADVANCED if key != "process")
 
 
 def framing(edit):
@@ -196,18 +299,20 @@ def clean(edit):
             if valid and value % 90 == 0 and value % 360:
                 result[key] = int(value % 360)
             continue
-        if key == "lut":
+        if key in ("lut", "profile"):
             if isinstance(value, str) and value:
                 result[key] = value
+            continue
+        if key in _CLEANERS:
+            cleaned = _CLEANERS[key](value)
+            if cleaned:
+                result[key] = cleaned
             continue
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             continue
         low, high = RANGES[key]
         value = min(high, max(low, value))
-        if key == "straighten":
-            value = round(float(value), 1)
-        else:
-            value = round(float(value), 2) if key == "exposure" else int(round(value))
+        value = round(float(value), FLOATS[key]) if key in FLOATS else int(round(value))
         if value != default:
             result[key] = value
     if set(result) == {"process"}:
@@ -226,12 +331,12 @@ def encode(linear):
     return _ENCODE[index]
 
 
-def shoulder(rgb, out=None):
-    """The highlight roll-off of RAWs (process 2): unchanged below RAW_SHOULDER, then towards 1, never reaching it.
+def shoulder(rgb, out=None, start=RAW_SHOULDER):
+    """The highlight roll-off of RAWs (process 2): unchanged below `start`, then towards 1, never reaching it.
 
     With `out` (which may be `rgb` itself) the result is written there.
     """
-    t = np.float32(RAW_SHOULDER)
+    t = np.float32(start)
     above = rgb > t
     if out is None:
         out = rgb.copy()
@@ -265,14 +370,62 @@ def _white_balance(temperature, tint):
     return gains / float(gains @ LUMA)
 
 
+def _white_balance_map(temperature, tint):
+    """_white_balance() per pixel: `temperature` and `tint` are h×w arrays (or numbers); returns h×w×3 gains."""
+    warm = np.asarray(temperature, dtype=np.float32) / 100 * 0.6
+    magenta = np.asarray(tint, dtype=np.float32) / 100 * 0.4
+    gains = np.stack(np.broadcast_arrays(np.exp2(warm), np.exp2(-magenta), np.exp2(-warm)), axis=-1)
+    gains /= (gains @ LUMA)[..., None]
+    return gains
+
+
+def _contrast_curve(x, contrast):
+    """The contrast S-curve on encoded values; `contrast` may be an array of the same shape."""
+    power = np.exp2(np.asarray(contrast, dtype=np.float32) / 100)  # 0.5 (flat) … 2 (punchy); 0, 0.5 and 1 stay put
+    return np.where(x < 0.5, 0.5 * np.power(2 * x, power), 1 - 0.5 * np.power(np.maximum(2 - 2 * x, 0), power))
+
+
+def _ends(x, whites, blacks):
+    """Whites and blacks on encoded values: they move the brightest and darkest tones, and the ends with them."""
+    if np.any(blacks):
+        x = x + np.asarray(blacks, dtype=np.float32) / 100 * 0.15 * (1 - np.clip(x, 0, 1)) ** 4
+    if np.any(whites):
+        x = x + np.asarray(whites, dtype=np.float32) / 100 * 0.15 * np.clip(x, 0, 1) ** 4
+    return x
+
+
+_TONE_KEYS = ("contrast", "whites", "blacks", *curves.PARAMETRIC, *curves.SPLITS, "curve")
+
+
 def _tone_table(contrast):
     """encode() followed by the contrast S-curve, as one table indexed like encode()."""
-    if not contrast:
-        return _ENCODE
-    power = 2.0 ** (contrast / 100)  # 0.5 (flat) … 2 (punchy); 0, 0.5 and 1 stay put
+    return _tone_tables({"contrast": contrast})[0]
+
+
+def _tone_tables(s):
+    """encode() followed by whites / blacks, contrast and the tone curves: (red, green, blue) tables indexed like encode().
+
+    The three are the same table when no channel has a curve of its own.
+    """
+    key = json.dumps({k: s.get(k) for k in _TONE_KEYS}, sort_keys=True)
+    return _cached_tables(key)
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_tables(key):
+    s = json.loads(key)
+    if not any(s.get(k) for k in ("contrast", "whites", "blacks", "curve", *curves.PARAMETRIC)):
+        return _ENCODE, _ENCODE, _ENCODE
     x = _ENCODE.astype(np.float64)
-    curved = np.where(x < 0.5, 0.5 * np.power(2 * x, power), 1 - 0.5 * np.power(2 - 2 * x, power))
-    return curved.astype(np.float32)
+    x = np.clip(_ends(x, s.get("whites") or 0, s.get("blacks") or 0), 0.0, 1.0)
+    if s.get("contrast"):
+        x = _contrast_curve(x, s["contrast"])
+    rgb, *channels = curves.channel_tables(s, x)
+    base = x if rgb is None else rgb
+    tables = [np.clip(c if c is not None else base, 0.0, 1.0).astype(np.float32) for c in channels]
+    if all(c is None for c in channels):
+        return tables[0], tables[0], tables[0]
+    return tuple(tables)
 
 
 def _grain(shape, origin, full_width, amount, size, seed):
@@ -291,51 +444,118 @@ def _grain(shape, origin, full_width, amount, size, seed):
     return noise[row_offset:row_offset + height, col_offset:col_offset + width] * (amount / 100 * 0.12)
 
 
-def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=False, bits=8):
+def margin(edit, full_size, raw=False):
+    """Rows above and below a block that render() needs to give it as part of a picture of `full_size`."""
+    s = settings(edit)
+    local_keys = {key for mask in masks.active(s["masks"]) for key in mask["settings"] if key in masks.NEIGHBOURHOOD}
+    return local.margin(s, max(full_size), raw, local_keys, edit.get("_view"))
+
+
+def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=False, bits=8, pad=(0, 0),
+           rasters=None, lens=None):
     """Apply `edit` to `linear` (float32, h×w×3); returns sRGB uint8 h×w×3 (uint16 with `bits` 16).
 
     `raw` says that `linear` is a RAW's development, which process 2 rolls off
     in the highlights. `table` is the film simulation LUT from lut.build_table() (None: no LUT).
     `origin` (row, column) and `full_size` (height, width) place this block
-    in the full image when rendering in strips.
+    in the full image when rendering in strips. `pad` (rows above, rows below) are
+    extra rows of `linear` around the block, for the settings that read a
+    neighbourhood (see margin()); they are not part of the result. `rasters`
+    are the automatic masks the edit uses ({kind: h×w array over the source}),
+    and `lens` the lens's profile (lenses.find()).
     """
     s = settings(edit)
-    height, width = linear.shape[:2]
+    pad_top, pad_bottom = pad
+    height, width = linear.shape[0] - pad_top - pad_bottom, linear.shape[1]
     full_height, full_width = full_size or (height, width)
+    view = edit.get("_view")  # what to show instead of the photo, see local.apply()
 
     # Every step works in place on `rgb`, then `out`, so a large image is not copied at each step.
     rgb = np.multiply(linear, _white_balance(s["temperature"], s["tint"]) * np.float32(2.0 ** s["exposure"]))
 
-    if s["highlights"] or s["shadows"]:
+    if lenses.has_vignetting(s, lens):
+        geometry = masks.Geometry(edit, (full_height, full_width))
+        x, y = geometry.pixel_coords(origin[0] - pad_top, rgb.shape[0])
+        rgb *= lenses.vignette_gain(s, lens, geometry, x, y)[..., None]
+        del x, y
+
+    maps = masks.local_maps(s["masks"], edit, (full_height, full_width), origin[0], height, rasters)
+    neighbourhood = {key: maps[key] for key in masks.NEIGHBOURHOOD if key in maps}
+    if neighbourhood or local.amounts(s, raw) or view in ("sharpen_mask", "spots"):
+        rgb = local.apply(rgb, s, max(full_height, full_width), raw, pad, neighbourhood, view)
+        if view in ("sharpen_mask", "spots"):
+            encoded = _encode_in_place(rgb)
+            return _to_uint16(encoded) if bits == 16 else _to_uint8(encoded)
+    elif pad_top or pad_bottom:
+        rgb = rgb[pad_top:pad_top + height]
+
+    if "exposure" in maps or "temperature" in maps or "tint" in maps:
+        gains = _white_balance_map(maps.get("temperature", 0), maps.get("tint", 0))
+        if "exposure" in maps:
+            gains = gains * np.exp2(maps["exposure"])[..., None]
+        rgb *= gains
+        del gains
+
+    highlights = s["highlights"] + maps.get("highlights", 0)
+    shadows = s["shadows"] + maps.get("shadows", 0)
+    if np.any(highlights) or np.any(shadows):
         perceived = _encode_in_place(rgb @ LUMA)
         stops = np.zeros((height, width), dtype=np.float32)
-        if s["highlights"]:
-            stops += s["highlights"] / 100 * _smoothstep(0.45, 1.0, perceived)
-        if s["shadows"]:
-            stops += s["shadows"] / 100 * 1.5 * (1 - _smoothstep(0.0, 0.5, perceived))
+        if np.any(highlights):
+            stops += highlights / 100 * _smoothstep(0.45, 1.0, perceived)
+        if np.any(shadows):
+            stops += shadows / 100 * 1.5 * (1 - _smoothstep(0.0, 0.5, perceived))
         del perceived
         np.exp2(stops, out=stops)
         rgb *= stops[..., None]
         del stops
 
-    if raw and edit.get("process", PROCESS) >= 2:  # (not settings(): clean() drops a process left alone)
-        shoulder(rgb, out=rgb)
+    if raw and raw != "profiled" and edit.get("process", PROCESS) >= 2:  # (not settings(): clean() drops a process left alone)
+        if raw == "neutral":  # flatter: a little darker, rolled off from lower down
+            rgb *= np.float32(0.85)
+            shoulder(rgb, out=rgb, start=RAW_SHOULDER * 0.6)
+        else:
+            shoulder(rgb, out=rgb)
 
-    tone = _tone_table(s["contrast"])
+    tones = _tone_tables(s)
     np.clip(rgb, 0.0, 1.0, out=rgb)
     rgb *= _ENCODE_STEPS
     index = rgb.astype(np.uint16)
     del rgb  # freed before the result is allocated (np.take(out=) would copy the index to 64 bits)
-    out = tone[index]
+    if tones[0] is tones[1] is tones[2]:
+        out = tones[0][index]
+    else:
+        out = np.empty(index.shape, dtype=np.float32)
+        for channel in range(3):
+            out[..., channel] = tones[channel][index[..., channel]]
     del index
 
-    if s["saturation"]:
+    if "whites" in maps or "blacks" in maps:
+        out = _ends(out, maps.get("whites", 0)[..., None] if "whites" in maps else 0,
+                    maps.get("blacks", 0)[..., None] if "blacks" in maps else 0).astype(np.float32)
+        np.clip(out, 0.0, 1.0, out=out)
+    if "contrast" in maps:
+        out = _contrast_curve(np.clip(out, 0.0, 1.0), maps["contrast"][..., None]).astype(np.float32)
+
+    saturation = s["saturation"] + maps.get("saturation", 0)
+    if np.any(saturation):
         grey = (out @ LUMA)[..., None]
         out -= grey
-        out *= np.float32(1 + s["saturation"] / 100)
+        out *= (1 + np.asarray(saturation, dtype=np.float32) / 100)[..., None] if np.ndim(saturation) else np.float32(
+            1 + saturation / 100)
         out += grey
         np.clip(out, 0.0, 1.0, out=out)
         del grey
+
+    if s["vibrance"] or colours.has_mixer(s):
+        colours.apply_hsl(out, s, s["vibrance"])
+        np.clip(out, 0.0, 1.0, out=out)
+
+    if s["bw"]:
+        colours.apply_bw(out, s)
+
+    if colours.has_grading(s):
+        colours.apply_grading(out, s)
 
     if table is not None and s["lut_strength"]:
         graded = apply_lut(_to_uint8(out.copy()), table).astype(np.float32)
@@ -362,6 +582,19 @@ def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=
 
     np.clip(out, 0.0, 1.0, out=out)
     return _to_uint16(out) if bits == 16 else _to_uint8(out)
+
+
+def render_rows(linear, top, bottom, edit, table=None, seed=0, full_size=None, raw=False, bits=8, rasters=None,
+                lens=None, extra=None):
+    """render() of rows `top` to `bottom` of the whole picture `linear`, with the margin they need around them.
+
+    `extra` is the margin, when already known.
+    """
+    full_size = full_size or linear.shape[:2]
+    extra = margin(edit, full_size, raw) if extra is None else extra
+    first, last = max(0, top - extra), min(linear.shape[0], bottom + extra)
+    return render(linear[first:last], edit, table, seed, (top, 0), full_size, raw, bits, (top - first, last - bottom),
+                  rasters, lens)
 
 
 def _encode_in_place(linear):

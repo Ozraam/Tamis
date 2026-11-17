@@ -24,8 +24,8 @@ import rawpy
 from PyQt6.QtCore import QBuffer, QIODevice, QObject, Qt, QThread, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QColorSpace, QImage, QImageReader, QPixmap
 
-from . import develop, exif, exportsettings, lut, metadata, stego, watermark
-from .constants import THUMBNAIL_CACHE_BYTES, is_raw
+from . import develop, exif, exportsettings, lenses, lut, masks, metadata, profiles, spots, stego, watermark
+from .constants import THUMBNAIL_CACHE_BYTES, copy_number, file_of, is_raw
 from .fileops import atomic_write, free_name
 from .imaging import array_to_image, image_to_array, resize_array, to_srgb
 from .loader import file_state, pixmap_bytes, thumbnail_decode_size
@@ -42,11 +42,116 @@ class EditError(Exception):
     pass
 
 
+class Context:
+    """What renders need besides the photo and its edit, set by the app: where lens profiles are, and
+    the store of automatic masks (automasks.MaskStore)."""
+
+    def __init__(self):
+        self.lens_folder = None
+        self.mask_store = None
+        self.profiles = {}  # profile id -> (DCP path, name, camera), see profiles.scan()
+        self.camera_profiles = {}  # camera (profiles.camera_name()) -> profile id used when a RAW has none
+        self._lenses = OrderedDict()  # (path, folder) -> correction or None
+        self._cameras = OrderedDict()  # path -> camera name
+        self._loaded = {}  # DCP path -> Profile
+        self._lock = threading.Lock()
+
+    def camera(self, path):
+        """The camera of a photo, as profiles name it ("" if unknown)."""
+        with self._lock:
+            if path in self._cameras:
+                return self._cameras[path]
+        info = exif.read_lens(path)
+        name = profiles.camera_name(info.get("make"), info.get("model")) if info.get("model") else ""
+        with self._lock:
+            self._cameras[path] = name
+            while len(self._cameras) > 512:
+                self._cameras.popitem(last=False)
+        return name
+
+    def profile(self, path, edit):
+        """The colour profile a RAW is developed with: its own, else its camera's default; None for Standard."""
+        if not is_raw(path):
+            return None
+        chosen = edit.get("profile")
+        if chosen is None and self.camera_profiles:
+            chosen = self.camera_profiles.get(self.camera(path))
+        if profiles.is_dcp(chosen) and chosen not in self.profiles:
+            return None  # missing from the folders: Standard, until it is back
+        return chosen
+
+    def load_profile(self, profile_id):
+        """The Profile of a DCP id, None if it can't be read."""
+        entry = self.profiles.get(profile_id)
+        if entry is None:
+            return None
+        path = entry[0]
+        with self._lock:
+            if path in self._loaded:
+                return self._loaded[path]
+        try:
+            found = profiles.load(path)
+        except (OSError, profiles.ProfileError, ValueError) as exc:
+            log.warning("Could not read the colour profile %s: %s", path, exc)
+            found = None
+        with self._lock:
+            self._loaded[path] = found
+        return found
+
+    def lens(self, path, edit):
+        """The lens profile of `path` when `edit` uses it (lenses.find()), else None."""
+        if not edit.get("lens_profile") or not self.lens_folder:
+            return None
+        key = (path, self.lens_folder)
+        with self._lock:
+            if key in self._lenses:
+                return self._lenses[key]
+        try:
+            found = lenses.find(exif.read_lens(path), self.lens_folder)
+        except Exception:  # a broken database or file: no profile
+            log.exception("Looking up the lens profile of %s failed", path)
+            found = None
+        with self._lock:
+            self._lenses[key] = found
+            while len(self._lenses) > 256:
+                self._lenses.popitem(last=False)
+        return found
+
+    def rasters(self, path, edit):
+        """The automatic masks `edit` uses, as found for `path` ({kind: array}); those not found yet are left out."""
+        kinds = masks.automatic_kinds(edit.get("masks"))
+        if not kinds or self.mask_store is None:
+            return None
+        return self.mask_store.load(path, kinds)
+
+
+CONTEXT = Context()
+
+
 # -- sources -------------------------------------------------------------------
 
 def process_of(path, edit):
-    """How `edit` develops `path` (develop.PROCESS): what a developed photo is cached by."""
-    return edit.get("process", develop.PROCESS) if is_raw(path) else develop.PROCESS
+    """How `edit` develops `path`: what a developed photo is cached by. The process (develop.PROCESS), or
+    (process, colour profile) for a RAW developed with a DCP profile."""
+    if not is_raw(path):
+        return develop.PROCESS
+    process = edit.get("process", develop.PROCESS)
+    profile = CONTEXT.profile(path, edit)
+    return (process, profile) if profiles.is_dcp(profile) else process
+
+
+def raw_mode(path, edit):
+    """What develop.render() is told of the photo's kind: False, or how a RAW's highlights are rolled off
+    (True, profiles.NEUTRAL, or "profiled" when its DCP has a tone curve of its own)."""
+    if not is_raw(path):
+        return False
+    profile = CONTEXT.profile(path, edit)
+    if profile == profiles.NEUTRAL:
+        return profiles.NEUTRAL
+    if profiles.is_dcp(profile):
+        found = CONTEXT.load_profile(profile)
+        return "profiled" if found is not None and found.has_tone else True
+    return True
 
 
 def _source(path, max_size, process=develop.PROCESS, half=None):
@@ -55,10 +160,20 @@ def _source(path, max_size, process=develop.PROCESS, half=None):
     `half(width, height)`, given the RAW's size, says whether developing it at half size is enough
     (always so with `max_size`).
     """
+    path = file_of(path)  # a virtual copy is developed from its file
     if is_raw(path):
+        process, profile = process if isinstance(process, tuple) else (process, None)
+        dcp = CONTEXT.load_profile(profile) if profile else None
         with rawpy.imread(path) as raw:
             options = {"gamma": (1, 1), "output_bps": 16, "use_camera_wb": True}
             options["half_size"] = max_size is not None or bool(half and half(raw.sizes.width, raw.sizes.height))
+            if dcp is not None:
+                # The camera's own colours, white balanced: the profile turns them into sRGB (see _linearize()).
+                options.update(
+                    output_color=rawpy.ColorSpace.raw, no_auto_bright=True, highlight_mode=rawpy.HighlightMode.Blend
+                )
+                pixels = raw.postprocess(**options)
+                return (resize_array(pixels, max_size) if max_size else pixels), dcp
             if process >= 2:
                 # A fixed gain (in _linearize) instead of LibRaw's automatic brightness, which clips
                 # the brightest 1% and changes from one photo to the next; clipped channels are blended.
@@ -79,6 +194,8 @@ def _source(path, max_size, process=develop.PROCESS, half=None):
 
 
 def _linearize(block, kind):
+    if isinstance(kind, profiles.Profile):
+        return kind.linearize(block)
     if kind == "raw16":
         return block.astype(np.float32) * np.float32(develop.RAW_GAIN / 65535)
     if kind == "linear16":
@@ -110,55 +227,83 @@ def _seed(path):
     return zlib.crc32(os.path.basename(path).encode("utf-8"))
 
 
-def render_parallel(linear, edit, table, seed, raw=False):
+def render_parallel(linear, edit, table, seed, raw=False, rasters=None, lens=None):
     """develop.render() over strips of `linear`, in parallel."""
     height, width = linear.shape[:2]
-    step = max(16, -(-height // (_STRIP_THREADS * 2)))
+    extra = develop.margin(edit, (height, width), raw)
+    step = max(16, -(-height // (_STRIP_THREADS * 2)), 2 * extra)
     starts = range(0, height, step)
     parts = _strip_pool.map(
-        lambda top: develop.render(linear[top:top + step], edit, table, seed, (top, 0), (height, width), raw), starts
+        lambda top: develop.render_rows(
+            linear, top, min(height, top + step), edit, table, seed, (height, width), raw, rasters=rasters, lens=lens,
+            extra=extra,
+        ),
+        starts,
     )
     return np.concatenate(list(parts))
+
+
+def _rows_parallel(function, height):
+    """function(top, bottom) over the rows of a picture of that height, in parallel; the parts put back together."""
+    step = max(16, -(-height // (_STRIP_THREADS * 2)))
+    return np.concatenate(list(_strip_pool.map(lambda top: function(top, min(height, top + step)), range(0, height, step))))
 
 
 def straighten_parallel(pixels, degrees):
     """develop.straighten_rows() over the whole of `pixels`, in parallel."""
-    height = pixels.shape[0]
-    step = max(16, -(-height // (_STRIP_THREADS * 2)))
-    parts = _strip_pool.map(
-        lambda top: develop.straighten_rows(pixels, degrees, top, min(height, top + step)), range(0, height, step)
-    )
-    return np.concatenate(list(parts))
+    return _rows_parallel(lambda top, bottom: develop.straighten_rows(pixels, degrees, top, bottom), pixels.shape[0])
+
+
+def corrected(pixels, edit, lens=None):
+    """`pixels` (a developed source) with the lens's distortion and chromatic aberration corrected and spots removed:
+    what the photo is before it is framed. `pixels` itself when there is nothing to do."""
+    s = develop.settings(edit)
+    if lenses.has_geometry(s, lens):
+        pixels = _rows_parallel(lambda top, bottom: lenses.warp_rows(pixels, s, lens, top, bottom), pixels.shape[0])
+    return spots.apply(pixels, s["spots"])
+
+
+def _correction_key(edit, lens):
+    """What corrected() depends on in `edit`, as a string."""
+    s = develop.settings(edit)
+    keys = ("distortion", "ca_red", "ca_blue", "lens_profile", "lens_distortion", "spots")
+    return json.dumps([{key: s[key] for key in keys}, lens if lenses.has_geometry(s, lens) else None], sort_keys=True)
 
 
 # -- full resolution -------------------------------------------------------------
 
-def _framed(pixels, edit):
-    """`pixels` (a full-size source) turned, straightened and cropped as `edit` says."""
-    pixels = develop.turn_array(pixels, edit.get("rotate", 0))
+def _framed(pixels, edit, lens=None):
+    """`pixels` (a full-size source) corrected, turned, straightened and cropped as `edit` says."""
+    pixels = develop.turn_array(corrected(pixels, edit, lens), edit.get("rotate", 0))
     if edit.get("straighten"):
         pixels = straighten_parallel(pixels, edit["straighten"])
     return develop.crop_array(pixels, edit.get("crop"))
 
 
-def render_full(pixels, kind, edit, table, seed, raw, bits=8):
+def render_full(pixels, kind, edit, table, seed, raw, bits=8, rasters=None, lens=None):
     """develop.render() of the framed source `pixels` (as _source() gives them), in strips that bound memory.
 
     Returns uint8 (or uint16 with `bits` 16) h×w×3.
     """
     height, width = pixels.shape[:2]
     out = np.empty((height, width, 3), dtype=np.uint16 if bits == 16 else np.uint8)
-    strip = 240 * _STRIP_THREADS  # sequential chunks bound memory; each is rendered in parallel
+    extra = develop.margin(edit, (height, width), raw)
+    rows_each = max(240, 2 * extra)  # rows per strip: the margin around each is not wasted on too few
+    strip = rows_each * _STRIP_THREADS  # sequential chunks bound memory; each is rendered in parallel
     for top in range(0, height, strip):
-        block = _linearize(pixels[top:top + strip], kind)
-        rows = block.shape[0]
-        parts = _strip_pool.map(
-            lambda y, block=block, top=top: develop.render(
-                block[y:y + 240], edit, table, seed, (top + y, 0), (height, width), raw, bits
-            ),
-            range(0, rows, 240),
-        )
-        out[top:top + rows] = np.concatenate(list(parts))
+        first, last = max(0, top - extra), min(height, top + strip + extra)
+        block = _linearize(pixels[first:last], kind)
+        bottom = min(height, top + strip)
+
+        def part(y, block=block, first=first, last=last, bottom=bottom):
+            end = min(bottom, y + rows_each)
+            above, below = max(first, y - extra), min(last, end + extra)
+            return develop.render(
+                block[above - first:below - first], edit, table, seed, (y, 0), (height, width), raw, bits,
+                (y - above, below - end), rasters, lens,
+            )
+
+        out[top:bottom] = np.concatenate(list(_strip_pool.map(part, range(top, bottom, rows_each))))
     return out
 
 
@@ -228,13 +373,18 @@ def export_photo(
 
     half = (lambda width, height: half_size_will_do(width, height, edit, long_edge)) if long_edge else None
     pixels, kind = _source(path, None, process_of(path, edit), half)
-    out = render_full(_framed(pixels, edit), kind, edit, table, _seed(path), is_raw(path), fmt.bits)
+    lens = CONTEXT.lens(path, edit)
+    out = render_full(
+        _framed(pixels, edit, lens), kind, edit, table, _seed(path), raw_mode(path, edit), fmt.bits,
+        CONTEXT.rasters(path, edit), lens,
+    )
     del pixels
     height, width = out.shape[:2]
 
     os.makedirs(dest_dir, exist_ok=True)
     if name is None:
-        name = free_name(dest_dir, os.path.splitext(os.path.basename(path))[0], fmt.extension)
+        stem = os.path.splitext(os.path.basename(file_of(path)))[0]
+        name = free_name(dest_dir, f"{stem}-{copy_number(path)}" if copy_number(path) else stem, fmt.extension)
     dest = os.path.join(dest_dir, name)
     image = array_to_image(out)
     del out
@@ -261,6 +411,9 @@ def export_photo(
 
 
 # -- live previews ---------------------------------------------------------------
+
+_NO_CORRECTION = _correction_key({}, None)
+
 
 class EditRenderer(QObject):
     """Renders edited previews in the background; results arrive as `rendered(path)`.
@@ -368,7 +521,11 @@ class EditRenderer(QObject):
                     process = process_of(path, edit)
                     pixels, kind = self._full_source(path, process)
                     table = self.table(lut_path) if lut_path else None
-                    out = render_full(_framed(pixels, edit), kind, edit, table, _seed(path), is_raw(path))
+                    lens = CONTEXT.lens(path, edit)
+                    out = render_full(
+                        _framed(pixels, edit, lens), kind, edit, table, _seed(path), raw_mode(path, edit),
+                        rasters=CONTEXT.rasters(path, edit), lens=lens,
+                    )
                     image, error = array_to_image(out), ""
                     del out
                 except Exception as exc:  # a bad photo or LUT must not kill the worker
@@ -384,7 +541,7 @@ class EditRenderer(QObject):
         return job
 
     def _full_source(self, path, process):
-        key = (path, process)
+        key = (file_of(path), process)
         with self._lock:
             if key in self._full_sources:
                 return self._full_sources[key]
@@ -437,9 +594,12 @@ class EditRenderer(QObject):
                     process = process_of(path, edit)
                     full, half = self._base(path, process)
                     table = self.table(lut_path) if lut_path else None
-                    upright = self._upright(path, process, quick, half if quick else full, edit)
+                    lens = CONTEXT.lens(path, edit)
+                    upright = self._upright(path, process, quick, half if quick else full, edit, lens)
                     linear = develop.crop_array(upright, edit.get("crop"))
-                    image = array_to_image(render_parallel(linear, edit, table, _seed(path), is_raw(path)))
+                    image = array_to_image(render_parallel(
+                        linear, edit, table, _seed(path), raw_mode(path, edit), CONTEXT.rasters(path, edit), lens
+                    ))
                     error = ""
                 except Exception as exc:  # a bad photo or LUT must not kill the worker
                     log.exception("Rendering the edit of %s failed", path)
@@ -454,8 +614,12 @@ class EditRenderer(QObject):
 
         return job
 
+    def base(self, path, process):
+        """The photo as developed for previews (linear float32 RGB): what tools on the photo read. Called from the GUI thread."""
+        return self._base(path, process)[0]
+
     def _base(self, path, process):
-        key = (path, process)
+        key = (file_of(path), process)  # shared by a photo and its virtual copies
         with self._lock:
             if key in self._bases:
                 self._bases.move_to_end(key)
@@ -468,17 +632,18 @@ class EditRenderer(QObject):
                 self._bases.popitem(last=False)
         return full, half
 
-    def _upright(self, path, process, quick, base, edit):
-        """`base` turned and straightened as `edit` says."""
+    def _upright(self, path, process, quick, base, edit, lens=None):
+        """`base` corrected, turned and straightened as `edit` says."""
         rotate, straighten = edit.get("rotate", 0), edit.get("straighten", 0)
-        if not rotate and not straighten:
+        correction = _correction_key(edit, lens)
+        if not rotate and not straighten and correction == _NO_CORRECTION:
             return base
-        key = (path, process, quick, rotate, straighten)
+        key = (path, process, quick, rotate, straighten, correction)
         with self._lock:
             if key in self._turned:
                 self._turned.move_to_end(key)
                 return self._turned[key]
-        pixels = np.ascontiguousarray(develop.turn_array(base, rotate))
+        pixels = np.ascontiguousarray(develop.turn_array(corrected(base, edit, lens), rotate))
         if straighten:
             pixels = straighten_parallel(pixels, straighten)
         with self._lock:
@@ -560,7 +725,9 @@ def _rename_keys(cache, mapping):
 
 # -- thumbnails ------------------------------------------------------------------
 
-PIPELINE = 2  # goes up when renders of the same edit change (2: RAW process 2, colour spaces, 16-bit sources)
+# Goes up when renders of the same edit change (2: RAW process 2, colour spaces, 16-bit sources;
+# 3: default sharpening and colour noise reduction of RAWs).
+PIPELINE = 3
 
 class EditThumbnails(QObject):
     """Small renders of edits; results arrive as `ready(path)`.
@@ -641,18 +808,27 @@ class EditThumbnails(QObject):
         state = file_state(path)
         lut_state = file_state(lut_path) if lut_path else None
         # PIPELINE: thumbnails rendered by an older pipeline, from an edit that reads the same, are a miss.
-        digest = hashlib.sha1(f"{PIPELINE}\0{key}\0{lut_state}".encode("utf-8", "surrogateescape")).hexdigest()
+        # What the render depends on besides the edit: the RAW's profile, the lens's, the automatic masks found.
+        extra = json.dumps([
+            process_of(path, edit), CONTEXT.lens(path, edit), sorted(CONTEXT.rasters(path, edit) or ()),
+        ], sort_keys=True, default=str)
+        digest = hashlib.sha1(f"{PIPELINE}\0{key}\0{lut_state}\0{extra}".encode("utf-8", "surrogateescape")).hexdigest()
         disk_key = f"{size}:{digest}"
         if self._disk and state:
             cached = self._disk.load(path, state, disk_key)
             if cached is not None:
                 return cached
         table = self._renderer.table(lut_path) if lut_path else None
-        linear = develop.turn_array(self._base(path, size, process_of(path, edit)), edit.get("rotate", 0))
+        lens = CONTEXT.lens(path, edit)
+        base = corrected(self._base(path, size, process_of(path, edit)), edit, lens)
+        linear = develop.turn_array(base, edit.get("rotate", 0))
         if edit.get("straighten"):
             linear = develop.straighten_rows(linear, edit["straighten"], 0, linear.shape[0])
         linear = develop.crop_array(linear, edit.get("crop"))
-        image = array_to_image(develop.render(linear, edit, table, _seed(path), raw=is_raw(path))).scaled(
+        rendered = develop.render(
+            linear, edit, table, _seed(path), raw=raw_mode(path, edit), rasters=CONTEXT.rasters(path, edit), lens=lens
+        )
+        image = array_to_image(rendered).scaled(
             size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
         )
         if self._disk and state:
@@ -660,7 +836,7 @@ class EditThumbnails(QObject):
         return image
 
     def _base(self, path, size, process):
-        key = (path, process)
+        key = (file_of(path), process)
         with self._lock:
             if key in self._bases:
                 self._bases.move_to_end(key)

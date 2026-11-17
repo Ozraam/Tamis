@@ -142,7 +142,7 @@ class FolderMixin:
         if not self.folder or self.moving or self.scanner.busy:
             return
         self.loader.retry_failed_thumbnails()
-        known = {photo.path: photo.companions for photo in self.model.photos}
+        known = {photo.path: photo.companions for photo in self.model.photos if not photo.copy}  # (copies aren't files)
         self.scanner.refresh(self.folder, known, self.session_fallback_dir, ("refresh", self.folder, auto))
 
     def _apply_folder_changes(self, result, auto):
@@ -180,6 +180,8 @@ class FolderMixin:
         Photos are identified by path: nothing may keep referring to removed ones.
         `select`, a path, is the photo to show when the current one goes.
         """
+        if changes.removed:  # the virtual copies of a photo that goes go with it
+            changes.removed |= {photo.path for photo in self.model.photos if photo.copy and photo.file in changes.removed}
         current = self.model.photo(self.current_row).path if self.current_row >= 0 else None
         if current in changes.removed and select is None:
             # The next photo that stays, or else the one before.
@@ -190,7 +192,7 @@ class FolderMixin:
         compared = [self.model.photo(row).path for row in self.compare_rows]
         gone = changes.removed
         if gone:
-            files = [path for photo in self.model.photos if photo.path in gone for path in photo.files]
+            files = [path for photo in self.model.photos if photo.path in gone and not photo.copy for path in photo.files]
             self.loader.forget(files)
             for path in gone:
                 self.editor.forget(path)
@@ -315,6 +317,8 @@ class FolderMixin:
             if row == -1:
                 continue
             photo = self.model.photo(row)
+            if photo.copy:
+                continue  # the sidecar is its file's photo's: a virtual copy's marks stay in the session
             directory = os.path.dirname(photo.path)
             try:
                 if directory not in listings:

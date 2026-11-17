@@ -19,6 +19,9 @@ from .constants import (
     REJECT_DIR,
     SESSION_FILENAME,
     SUPPORTED_EXTENSIONS,
+    copy_number,
+    copy_path,
+    file_of,
     is_raw,
 )
 
@@ -80,6 +83,10 @@ class Photo:
     xmp_pending: bool = False
     # What was exported of this photo (to _EXPORTS or the folder of the settings), see fileops.export_record().
     exports: list = field(default_factory=list)
+    # The edit's history ({"label", "edit"}, oldest first, at most HISTORY_LENGTH) and its named
+    # snapshots ({name: edit}). Replaced, never changed in place, like `edit`.
+    history: list = field(default_factory=list)
+    snapshots: dict = field(default_factory=dict)
     # From the background analysis (analysis.py), not saved in the session: None until known.
     capture_time: float | None = None  # seconds, on the camera's clock
     sharpness: float | None = None  # only a suggestion: marks stay the user's
@@ -89,17 +96,29 @@ class Photo:
 
     @property
     def name(self):
-        return os.path.basename(self.path)
+        return os.path.basename(self.file)
+
+    @property
+    def file(self):
+        """The photo's file: its path, but for a virtual copy (see constants.COPY_MARK)."""
+        return file_of(self.path)
+
+    @property
+    def copy(self):
+        """0 for a photo, n for its virtual copy n."""
+        return copy_number(self.path)
 
     @property
     def display_name(self):
-        """`IMG_1.CR2 + JPG` for a pair."""
+        """`IMG_1.CR2 + JPG` for a pair, `IMG_1.CR2 · copy 2` for a virtual copy."""
         extras = [os.path.splitext(c)[1].lstrip('.').upper() for c in self.companions]
-        return " + ".join([self.name, *extras])
+        name = " + ".join([self.name, *extras])
+        return f"{name} · copy {self.copy}" if self.copy else name
 
     @property
     def files(self):
-        return [self.path, *self.companions]
+        """The files of the photo (shared with its virtual copies)."""
+        return [self.file, *self.companions]
 
 
 def natural_key(name):
@@ -205,6 +224,7 @@ def _read_saved(folder, groups, listings, fallback_dir, problems, all_names, pro
     # "Process Files" are not lost.
     session = load_session(folder, fallback_dir, problems)
     name_counts = Counter(all_names)
+    copies = []  # the virtual copies the session has of these photos
     for photo in photos:
         key = relative_key(folder, photo.path)
         entry = session.get(key)
@@ -216,6 +236,10 @@ def _read_saved(folder, groups, listings, fallback_dir, problems, all_names, pro
             photo.xmp_pending = entry.get("xmp_pending", False)
             photo.exports = entry.get("exports", [])
             photo.metadata = entry.get("metadata", {})
+            photo.history = entry.get("history", [])
+            photo.snapshots = entry.get("snapshots", {})
+            for number, copy_entry in sorted(entry.get("copies", {}).items()):
+                copies.append(_copy_of(photo, number, copy_entry))
         # Sidecars are what other editors change, and Tamis writes them
         # whenever a rating changes: they are the fresher source, unless
         # that write failed.
@@ -225,7 +249,24 @@ def _read_saved(folder, groups, listings, fallback_dir, problems, all_names, pro
                 photo.metadata = metadata.clean(found)
             if rating is not None:  # (None: the sidecar says "rejected", which is not a number of stars)
                 photo.rating = rating
-    return photos
+    return photos + copies
+
+
+def _copy_of(photo, number, entry):
+    """Virtual copy `number` of `photo`, as its session entry says."""
+    copy = Photo(copy_path(photo.path, number), entry["status"], photo.location, entry["rating"], entry["label"],
+                 companions=list(photo.companions), edit=entry["edit"])
+    copy.metadata = entry.get("metadata", {})
+    copy.history = entry.get("history", [])
+    copy.snapshots = entry.get("snapshots", {})
+    return copy
+
+
+def new_copy(photo, number):
+    """A new virtual copy of `photo`: its edit and description, marks of its own."""
+    copy = Photo(copy_path(photo.path, number), None, photo.location, companions=list(photo.companions), edit=photo.edit)
+    copy.metadata = photo.metadata
+    return copy
 
 
 def scan_folder(folder, fallback_dir=None, problems=None, progress=None):
@@ -315,6 +356,30 @@ def _export_records(value):
     ]
 
 
+HISTORY_LENGTH = 60
+
+
+def clean_history(value):
+    """A session's "history": valid steps only, the newest HISTORY_LENGTH."""
+    if not isinstance(value, list):
+        return []
+    steps = [
+        {"label": step["label"][:120], "edit": develop.clean(step.get("edit"))}
+        for step in value
+        if isinstance(step, dict) and isinstance(step.get("label"), str) and isinstance(step.get("edit"), dict)
+    ]
+    return steps[-HISTORY_LENGTH:]
+
+
+def clean_snapshots(value):
+    if not isinstance(value, dict):
+        return {}
+    return {
+        name.strip()[:80]: develop.clean(edit)
+        for name, edit in value.items() if isinstance(name, str) and name.strip() and isinstance(edit, dict)
+    }
+
+
 def _entry(value):
     """A session value as {"status", "rating", "label", "edit"}, or None if it is not valid.
 
@@ -341,6 +406,22 @@ def _entry(value):
     described = metadata.clean(value.get("metadata"))
     if described:
         entry["metadata"] = described
+    history = clean_history(value.get("history"))
+    if history:
+        entry["history"] = history
+    snapshots = clean_snapshots(value.get("snapshots"))
+    if snapshots:
+        entry["snapshots"] = snapshots
+    copies = value.get("copies")
+    if isinstance(copies, dict):
+        found = {}
+        for number, copy_value in copies.items():
+            copy_entry = _entry(copy_value) if isinstance(copy_value, dict) and str(number).isdigit() else None
+            if copy_entry is not None and int(number) > 0:
+                copy_entry.pop("copies", None)
+                found[int(number)] = copy_entry
+        if found:
+            entry["copies"] = found
     return entry
 
 
@@ -426,7 +507,8 @@ def write_json(path, data):
 
 
 def _session_value(photo):
-    if not (photo.rating or photo.label is not None or photo.edit or photo.xmp_pending or photo.exports or photo.metadata):
+    if not (photo.rating or photo.label is not None or photo.edit or photo.xmp_pending or photo.exports or photo.metadata
+            or photo.history or photo.snapshots):
         return photo.status  # same as older sessions
     value = {"status": photo.status, "rating": photo.rating, "label": photo.label}
     if photo.edit:
@@ -437,7 +519,16 @@ def _session_value(photo):
         value["exports"] = photo.exports
     if photo.metadata:
         value["metadata"] = photo.metadata
+    if photo.history:
+        value["history"] = photo.history
+    if photo.snapshots:
+        value["snapshots"] = photo.snapshots
     return value
+
+
+def _copy_value(photo):
+    value = _session_value(photo)
+    return value if isinstance(value, dict) else {"status": value, "rating": 0, "label": None}
 
 
 def _absent_entries(folder, stored, photos, known, forget):
@@ -455,7 +546,8 @@ def _absent_entries(folder, stored, photos, known, forget):
             continue  # a legacy filename key (or a move made elsewhere): that photo has the entry now
         entry = _entry(value)
         if entry is not None and (
-            entry["status"] or entry["rating"] or entry["label"] or entry["edit"] or "exports" in entry or "metadata" in entry
+            entry["status"] or entry["rating"] or entry["label"] or entry["edit"]
+            or any(key in entry for key in ("exports", "metadata", "history", "snapshots"))
         ):
             kept[key] = value
     return kept
@@ -465,10 +557,23 @@ def save_session(folder, photos, fallback_dir=None, forget=(), problems=None):
     """Save marks in `folder`, else in `fallback_dir`; returns the path written.
 
     Entries of photos not in `photos` are kept, unless their relative path
-    is in `forget` (the photo was moved). `problems` is as in load_session().
+    is in `forget` (the photo was moved). Virtual copies are kept in the entry
+    of their photo, under "copies". `problems` is as in load_session().
     Raises OSError when neither can be written.
     """
-    data = {relative_key(folder, photo.path): _session_value(photo) for photo in photos}
+    copies = {}
+    for photo in photos:
+        if photo.copy:
+            copies.setdefault(photo.file, {})[str(photo.copy)] = _copy_value(photo)
+    data = {}
+    for photo in photos:
+        if photo.copy:
+            continue
+        value = _session_value(photo)
+        if photo.path in copies:
+            value = value if isinstance(value, dict) else {"status": value, "rating": 0, "label": None}
+            value["copies"] = copies[photo.path]
+        data[relative_key(folder, photo.path)] = value
     data.update(_absent_entries(folder, _read_session(folder, fallback_dir, problems), photos, data, forget))
     data[FORMAT_KEY] = SESSION_FORMAT  # older versions skip it: it isn't a valid entry
     folder_path, *fallback = _session_paths(folder, fallback_dir)
@@ -503,6 +608,7 @@ class PhotoModel(QAbstractListModel):
         self._loader = loader
         self._photos = []
         self._rows = {}
+        self._copy_rows = {}  # file -> rows of its virtual copies
         # Kept up to date on every change so per-keystroke updates stay O(1).
         self._keeps = self._rejects = 0
         self.revision = 0  # counts changes of marks, ratings, labels and edits
@@ -606,13 +712,13 @@ class PhotoModel(QAbstractListModel):
         """
         regrouped = []
         for row, photo in enumerate(self._photos):
-            if photo.path in changes.regrouped:
-                photo.companions = changes.regrouped[photo.path]
+            if photo.file in changes.regrouped:  # (its virtual copies with it)
+                photo.companions = changes.regrouped[photo.file]
                 regrouped.append(row)
         if regrouped:
             self.dataChanged.emit(self.index(min(regrouped)), self.index(max(regrouped)), [Qt.ItemDataRole.ToolTipRole])
 
-        gone = [row for row, photo in enumerate(self._photos) if photo.path in changes.removed]
+        gone = [row for row, photo in enumerate(self._photos) if photo.path in changes.removed or photo.file in changes.removed]
         runs = [[row for _, row in run] for _, run in groupby(enumerate(gone), lambda item: item[1] - item[0])]
         for run in reversed(runs):
             self.beginRemoveRows(QModelIndex(), run[0], run[-1])
@@ -700,9 +806,10 @@ class PhotoModel(QAbstractListModel):
     def apply_moves(self, moved):
         """`moved`: old path -> (new path, location it was moved to), for photos and companions."""
         for photo in self._photos:
-            if photo.path in moved:
+            if photo.file in moved:  # a virtual copy goes with its file
                 self._tally(photo, -1)
-                photo.path, photo.location = moved[photo.path]
+                new, photo.location = moved[photo.file]
+                photo.path = copy_path(new, photo.copy)
                 photo.companions = [moved[c][0] if c in moved else c for c in photo.companions]
                 self._tally(photo, 1)
         self._reindex()
@@ -728,6 +835,10 @@ class PhotoModel(QAbstractListModel):
 
     def _reindex(self):
         self._rows = {photo.path: row for row, photo in enumerate(self._photos)}
+        self._copy_rows = {}
+        for row, photo in enumerate(self._photos):
+            if photo.copy:
+                self._copy_rows.setdefault(photo.file, []).append(row)
 
     def _emit_changed(self, changes):
         if not changes:
@@ -753,10 +864,14 @@ class PhotoModel(QAbstractListModel):
         self.photos_edited.emit(sorted({self.row_of(path) for path, _, _ in changes}))
 
     def _on_thumbnail_loaded(self, path):
-        row = self.row_of(path)
-        if row != -1:
-            index = self.index(row)
-            self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole, THUMBNAIL_FAILED_ROLE])
+        for row in [self.row_of(path), *self._copy_rows.get(path, ())]:  # the file's virtual copies show it too
+            if row != -1:
+                index = self.index(row)
+                self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole, THUMBNAIL_FAILED_ROLE])
+
+    def rows_of_file(self, path):
+        """The rows of the photo whose file is `path` and of its virtual copies."""
+        return [row for row in [self.row_of(file_of(path)), *self._copy_rows.get(file_of(path), ())] if row != -1]
 
 
 class StatusFilterProxy(QSortFilterProxyModel):
