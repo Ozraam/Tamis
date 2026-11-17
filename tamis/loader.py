@@ -13,7 +13,7 @@ from itertools import count
 from PyQt6.QtCore import QObject, QSize, QThread, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QImage, QPixmap
 
-from .constants import PREVIEW_CACHE_SIZE, PREVIEW_MAX_SIZE, THUMBNAIL_CACHE_BYTES, THUMBNAIL_MAX_SIZE
+from .constants import PREVIEW_CACHE_SIZE, PREVIEW_MAX_SIZE, THUMBNAIL_CACHE_BYTES, THUMBNAIL_MAX_SIZE, file_of
 from .exif import read_info
 from .imaging import load_image
 from .workers import emit_safely
@@ -37,7 +37,7 @@ def thumbnail_decode_size():
 def file_state(path):
     """What tells that a file has changed: (size, modification time), None if it can't be read."""
     try:
-        stat = os.stat(path)
+        stat = os.stat(file_of(path))
     except OSError:
         return None
     return stat.st_size, stat.st_mtime_ns
@@ -129,6 +129,7 @@ class ImageLoader(QObject):
 
     def rename_paths(self, mapping):
         """Carry cached images over after files have been moved."""
+        mapping = {file_of(old): file_of(new) for old, new in mapping.items()}
         caches = (self._previews, self._preview_errors, self._native_sizes, self._info, self._thumbnails,
                   self._thumbnail_failed, self._full, self._full_errors)
         for cache in caches:
@@ -143,22 +144,24 @@ class ImageLoader(QObject):
     # -- previews ----------------------------------------------------------
 
     def preview(self, path):
+        path = file_of(path)  # a virtual copy shows its file
         pixmap = self._previews.get(path)
         if pixmap is not None:
             self._previews.move_to_end(path)
         return pixmap
 
     def preview_error(self, path):
-        return self._preview_errors.get(path)
+        return self._preview_errors.get(file_of(path))
 
     def native_size(self, path):
-        return self._native_sizes.get(path)
+        return self._native_sizes.get(file_of(path))
 
     def info(self, path):
-        return self._info.get(path, {})
+        return self._info.get(file_of(path), {})
 
     def ensure_previews(self, current, neighbors):
         """Load `current` first, then prefetch `neighbors`; drop other queued work."""
+        current, neighbors = file_of(current), list(dict.fromkeys(file_of(path) for path in neighbors))
         self._wanted_previews = {current, *neighbors}
         # Coming back to a photo retries it: the error may have been transient
         # (file still copying, network share hiccup). Neighbours are not retried.
@@ -212,10 +215,10 @@ class ImageLoader(QObject):
     # -- full resolution ---------------------------------------------------
 
     def full_pixmap(self, path):
-        return self._full.get(path)
+        return self._full.get(file_of(path))
 
     def full_error(self, path):
-        return self._full_errors.get(path)
+        return self._full_errors.get(file_of(path))
 
     def ensure_full(self, paths, load=True):
         """Keep full resolution for `paths` only; decode the missing ones if `load`.
@@ -223,6 +226,7 @@ class ImageLoader(QObject):
         With `load=False` nothing new is decoded, but what is already loaded
         for `paths` stays, so zooming back in is instant.
         """
+        paths = list(dict.fromkeys(file_of(path) for path in paths))
         self._full_wanted = set(paths)
         for path in list(self._full):
             if path not in self._full_wanted:
@@ -262,6 +266,7 @@ class ImageLoader(QObject):
 
     def thumbnail(self, path):
         """Return the cached thumbnail, or None and queue it for loading."""
+        path = file_of(path)
         pixmap = self._thumbnails.get(path)
         if pixmap is not None:
             self._thumbnails.move_to_end(path)
@@ -272,10 +277,11 @@ class ImageLoader(QObject):
         return pixmap
 
     def thumbnail_error(self, path):
-        return path in self._thumbnail_failed
+        return file_of(path) in self._thumbnail_failed
 
     def forget(self, paths):
         """These files are gone: drop what is cached of them."""
+        paths = {file_of(path) for path in paths}
         self._wanted_previews -= set(paths)
         for path in paths:
             pixmap = self._thumbnails.pop(path, None)

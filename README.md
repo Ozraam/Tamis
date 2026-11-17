@@ -25,6 +25,20 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - **RAW+JPEG pairs** (same name, same folder) are culled as one photo and always move together.
 - **Shooting info** (exposure, aperture, ISO, focal length, camera, lens, date) read from EXIF; `I` shows or hides it.
 - **Quick edits** (`E`): exposure, contrast, highlights, shadows, white balance (temperature / tint), saturation, film simulation LUTs with strength, grain and vignette. Edits are non-destructive (stored in the session, originals untouched), previewed live, can be copied and pasted across photos, and exported as JPEGs (see **Export settings**). RAWs are edited from LibRaw's 16-bit linear development, not from their embedded JPEG: with the edit panel open, a RAW shows that development even before it is edited, so the first slider moved doesn't change the whole picture, and the panel says so. Highlights are kept rather than clipped: the development uses one fixed brightness for every photo (so an edit pasted over a burst looks even) and rolls the brightest tones off, so **Exposure** and **Highlights** can bring them back. RAW edits made before this keep their earlier development, which clipped the brightest 1%, until **Use the New Development** in the panel switches them, with the exposure adjusted so that the photo stays as bright (undoable). Other images are converted to sRGB from their own colour space (Adobe RGB, Display P3…), for culling as for editing, and 16-bit TIFFs and PNGs are edited at 16 bits.
+- **Advanced tab** of the edit panel, for finer work; the Basic tab stays as it was for quick edits while culling. The tab's title gets a dot when the photo uses any of it, and so do its sections, so nothing is hidden; Reset, copy and paste and presets cover both tabs. In it:
+  - **Auto Tone** sets exposure, contrast, highlights, shadows, whites and blacks from the histogram, **Auto WB** takes away a colour cast, and **Pick WB** makes the point you click neutral grey. Each is an ordinary, undoable change to the sliders, a starting point to adjust.
+  - **Whites** and **Blacks**, which move the ends of the tones next to Highlights and Shadows.
+  - **Tone curve**: a point curve for RGB and for each channel, drawn over the histogram (click to add a point and drag it, double-click it to remove it), and a parametric curve (highlights, lights, darks, shadows, with movable splits). Curves never overshoot between points.
+  - **Colour mixer**: **Vibrance** (saturates muted colours more than vivid ones, and skin tones less), and hue, saturation and luminance for eight colour ranges (red, orange, yellow, green, aqua, blue, purple, magenta), blended smoothly from one range to the next. The target (◎) changes the range under the pointer: drag up or down on the photo.
+  - **Colour grading**: a wheel of hue and strength, with a luminance, for the shadows, midtones and highlights and one for the whole picture, with blending and balance.
+  - **Black & white**, with how bright each colour range becomes in grey; colour grading then tones it.
+  - **Detail**: texture (fine detail), clarity (midtone contrast at a larger radius, through an edge-aware filter that leaves no halos) and dehaze; sharpening (amount, radius, detail, and masking, which keeps it to the edges: hold `⌥` while dragging it to see what is sharpened); luminance and colour noise reduction. RAWs get a little sharpening and colour noise reduction by default, like in other editors. These read a pixel's neighbourhood, with radii in proportion to the picture, so a preview and a full-size export look the same; check them at 1:1, where the edit is rendered at full resolution.
+  - **Lens corrections**: distortion, vignetting and lateral chromatic aberration from the lens's profile in the [lensfun](https://lensfun.github.io) database, found from the camera and lens in the EXIF, each with an amount; and the same by hand, with a defringe slider for purple and green fringes. Tamis reads lensfun's XML files directly: it uses the database where lensfun is installed (Homebrew, Linux packages, `~/.local/share/lensfun`) or the folder chosen with **Lens Profiles Folder…** (a copy of lensfun's `data/db`).
+  - **Profile** (RAWs): how the camera's colours are rendered. *Standard* is the development Tamis always used, *Neutral* a flatter one, and DCP profiles (the format of Adobe and RawTherapee) are read from the folder chosen with **Folder…** and from Adobe's own folders when they are there, which gives the *Camera Matching* profiles to those who have Adobe's software (Tamis can't ship them). A DCP is applied to the camera's own colours, with its forward matrix, hue and saturation map, look table and tone curve. **Default for Camera** uses the photo's profile for every RAW of that camera that has none of its own.
+  - **Masks**: local adjustments with their own exposure, contrast, highlights, shadows, whites, blacks, temperature, tint, saturation, texture, clarity, dehaze and sharpness. A mask is made of linear gradients, radial gradients (drawn on the photo, then moved by their handles), brush strokes (size, feather, flow, and erase with `⌥`), and automatic masks of the **subject** and **people** (Apple's Vision, macOS 14 and later) or the **sky** (found from its colours, everywhere), with edges refined to follow the picture's. Parts are added to, subtracted from or intersected with the selected mask, which can be inverted and shown in red over the photo. Masks are placed on the photo itself, so they stay put through a crop or a turn; automatic ones are worked out once per photo and kept in the app's cache folder.
+  - **Spot removal** (`⇧Q`): click a spot or paint over a blemish; a source nearby that looks like its surroundings is found and can be moved, `⌥`-click removes a spot. *Heal* matches the surroundings' brightness and colour, *Clone* copies as is, and **Visualise spots** shows the photo's details in grey, where sensor dust stands out.
+  - **History & snapshots**: each change to a photo's edit (slider, preset, paste, mask…) is a step of its history; clicking one goes back to it. **Save Snapshot…** keeps a version of the edit under a name, to come back to it. Both are kept in the session, with the 60 newest steps.
+- **Virtual copies** (`⌘'`): a second photo on the same files, with its own marks, stars, label, edit, history and description, to try a black and white version, or several crops for different uses. It follows its photo in the filmstrip and the Gallery (`IMG_1.CR2 · copy 1`) and is saved in the session with it. Process Files moves the files once, with the photo's mark, or to `_KEEPS` when a copy is kept, and exports each copy on its own (`IMG_1-1.jpg`); Trash Rejects leaves files that a copy still uses. `⌘⇧⌫` removes virtual copies (never a photo), asking first when they hold marks or edits.
 - **Histogram and clipping**: the edit panel shows the red, green and blue histogram of what is on screen, updated in the background, with the share of the photo clipped at either end. `J` (or **Clipping**) shows them in the Cull view, panel open or not: red where all three channels are at the top (blown out, no detail left), a discreet orange where only one or two are (a vivid colour, flatter but not blown out), and blue where all three are at the bottom. The histogram's figures only count the red and the blue, so a very colourful photo doesn't look overexposed.
 - **Before / after**: hold `Y` or `\` (or the **Before** button) to see the photo without its edit, in the same frame; the edit itself doesn't change. It shows the same preview as an unedited photo; with the edit panel open, a RAW shows its own development there, not the camera's embedded JPEG.
 - **Rotate and straighten**: `]` / `⇧R` and `[` / `⇧L` turn the current or selected photos by 90°, while culling too; the **Straighten** slider levels a horizon by up to 15°, enlarging the picture so that no empty corner shows. A crop stays on the same part of the picture through a quarter turn. Like a crop, these belong to their photo's framing: they are undoable, exported and cleared by Reset, but neither copied nor kept in a preset, and vignette and grain follow the final frame.
@@ -80,6 +94,9 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Show the photo without its edit, while held (Cull view) | `Y` or `\` |
 | Clipping warnings, on / off (Cull view) | `J` |
 | Title, caption and keywords (current or selected) | `⌘K` / `Ctrl+K` |
+| Spot removal, on / off (Cull view) | `⇧Q` / `Shift+Q` |
+| Create a virtual copy (current or selected) | `⌘'` / `Ctrl+'` |
+| Remove virtual copies (current or selected) | `⌘⇧⌫` / `Ctrl+Shift+Backspace` |
 | Copy / paste edit (paste applies to the selection) | `⌘C` / `⌘V` or `⌘⇧C` / `⌘⇧V` (`Ctrl+C` / `V`, `Ctrl+Shift+C` / `V`) |
 | Export with the export settings (current or selected photos: edited ones and those without a JPEG are rendered, others copied unless resized, watermarked or in another format) | `⌘⇧E` / `Ctrl+Shift+E` |
 | Refresh the folder | `⌘R` / `Ctrl+R`, `F5` |
@@ -130,7 +147,7 @@ def register(tamis):
 | `version` | Tamis's version, such as `"0.1.0"`, to check compatibility (`"unknown"` when run from a checkout that was never installed) |
 | `window` | The main window, for anything else. It is not a stable interface: it may change between versions |
 
-`photos` is a photo or a path, or a list of them, and every `set_…` call is one undo step. A photo is a read-only snapshot with `path`, `name`, `files` (with its companions), `status`, `location`, `rating`, `label`, `edit` and `metadata` (its `title`, `caption` and `keywords`, those that are set).
+`photos` is a photo or a path, or a list of them, and every `set_…` call is one undo step. A photo is a read-only snapshot with `path`, `name`, `files` (with its companions), `status`, `location`, `rating`, `label`, `edit` and `metadata` (its `title`, `caption` and `keywords`, those that are set), `file` and `copy`. A virtual copy (`copy` 1, 2…) is a photo of its own on another's files: its `path` identifies it but isn't a file (it is the file's path, a NUL character and its number), so read `file` instead; for any other photo, `file` is `path` and `copy` is 0.
 
 | Event | Arguments | When |
 | --- | --- | --- |
@@ -152,6 +169,8 @@ Good to know:
 `tamis_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read, and so are `cullspeed_session.json` files from when the app was called CullSpeed; the next save replaces them. Ratings and labels are stored there too; when a photo has an XMP sidecar, its rating and label are read from the sidecar instead, so changes made in another editor win. If a rating can't be written to its sidecar, the session's value wins until a later save manages to write it.
 
 Marks of photos whose file is missing are kept, so a `_KEEPS` taken out of the folder and brought back gets them back. A session file that can't be read is never overwritten: it is renamed `tamis_session.corrupt.json`, the app says so, and the next most recent session is used if there is one.
+
+An edit's history and snapshots are stored in the photo's entry too (`history`, `snapshots`), and so are its virtual copies (`copies`, by number), each with its own marks and edit.
 
 If the photo folder is read-only (locked SD card, read-only share), marks are saved in the app's own data folder instead and reloaded from there when the folder is reopened.
 
@@ -182,7 +201,19 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/cropping.py` | Geometry of the crop frame while it is dragged |
 | `tamis/lut.py` | HaldCLUT / `.cube` loading and fast 256³ lookup tables |
 | `tamis/editing.py` | Developing photos for editing, background previews, full-resolution renders and thumbnails of edits, export |
-| `tamis/editpanel.py` | The edit panel and its histogram |
+| `tamis/editpanel.py` | The edit panel (Basic and Advanced tabs) and its histogram |
+| `tamis/editwidgets.py` | Widgets of the Advanced tab: folding sections, the tone curve editor, the colour wheel |
+| `tamis/advancedui.py` | The Advanced tab from the main window: tools on the photo, masks, spots, auto settings, lens and colour profiles, history, snapshots, virtual copies (part of the main window) |
+| `tamis/edittools.py` | Tools that work on the photo in the Cull view: white balance picker, colour target, gradients, brush, spots |
+| `tamis/curves.py` | Tone curves: monotone point curves and the parametric curve |
+| `tamis/colours.py` | Vibrance, the HSL mixer, black and white and colour grading |
+| `tamis/local.py` | Settings that read a pixel's neighbourhood: noise reduction, dehaze, texture, clarity, sharpening, defringe |
+| `tamis/masks.py` | Local adjustments: masks, where they lie on the picture, and their weights |
+| `tamis/automasks.py` | Automatic masks of the subject, people (Vision) and sky, kept on disk |
+| `tamis/spots.py` | Spot removal: healing and cloning, and finding a source |
+| `tamis/lenses.py` | Lens profiles from lensfun's XML database, and correcting distortion, vignetting and chromatic aberration |
+| `tamis/profiles.py` | Camera colour profiles for RAWs: built-in ones and DCPs |
+| `tamis/autoadjust.py` | Automatic white balance and tone |
 | `tamis/tones.py` | Histograms and clipping overlays, and their background worker |
 | `tamis/presets.py` | Named looks, kept in the app's data folder |
 | `tamis/exportsettings.py` | Export format, size, quality, folder, name pattern, watermark, credits and profiles |
@@ -208,11 +239,12 @@ ruff check .
 ```
 CI runs both on every push and pull request (`.github/workflows/ci.yml`), on macOS, Linux and Windows. The RAW tests use tiny DNGs written on the fly (`tests/rawfiles.py`), so no camera file is shipped.
 
-To build a standalone app (`dist/Tamis.app` on macOS):
+To build a standalone app (`dist/Tamis.app` on macOS, `dist/Tamis/` elsewhere):
 ```bash
 pip install -e ".[build]"
 ./scripts/build_app.sh
 ```
+Pull requests into `master` also build it on Linux and Windows (`.github/workflows/build.yml`, or by hand from the Actions tab); each build is attached to the run as an artifact for 14 days. These builds are unsigned and only meant for trying a change there.
 
 Measuring:
 ```bash
@@ -225,7 +257,7 @@ python scripts/sharpness_report.py <culled folder>   # sharpness scores against 
 ### Releases
 `scripts/build_app.sh` gives the bundle the version of `pyproject.toml` (`CFBundleShortVersionString`) and signs it ad hoc. `scripts/package_macos.sh` wraps it in `dist/Tamis-<version>.dmg` and a `.zip`.
 
-Pushing a tag such as `v0.2.0` (matching `pyproject.toml`) runs `.github/workflows/release.yml`, which tests, builds and packages the app and publishes the DMG and zip as a GitHub release with generated notes. No Apple Developer account is needed: the app is signed ad hoc and not notarized, so **macOS blocks it the first time it is opened**. To open it anyway: try once, then **System Settings › Privacy & Security › Open Anyway**; or in Terminal:
+Pushing a tag such as `v0.2.0` (matching `pyproject.toml`) runs `.github/workflows/release.yml`, which tests, builds and packages the app and publishes the DMG and zip as a GitHub release with generated notes. Linux and Windows builds (`Tamis-<version>-linux.tar.gz`, `Tamis-<version>-windows.zip`, unsigned) are then added to the same release; if one of them fails, the macOS release stays as it is. No Apple Developer account is needed: the app is signed ad hoc and not notarized, so **macOS blocks it the first time it is opened**. To open it anyway: try once, then **System Settings › Privacy & Security › Open Anyway**; or in Terminal:
 ```bash
 xattr -dr com.apple.quarantine /Applications/Tamis.app
 ```

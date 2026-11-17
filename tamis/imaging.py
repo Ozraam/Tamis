@@ -9,7 +9,7 @@ import rawpy
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
 from PyQt6.QtGui import QColorSpace, QImage, QImageIOHandler, QImageReader, QTransform
 
-from .constants import is_raw
+from .constants import file_of, is_raw
 
 
 class ImageLoadError(Exception):
@@ -32,6 +32,7 @@ def load_image(path, max_size):
     preview can then be shown at true 1:1 scale while zoomed.
     `max_size=None` decodes at full resolution (for 1:1 zoom).
     """
+    path = file_of(path)  # a virtual copy's
     image, native = _load_raw(path, max_size) if is_raw(path) else _read(path, max_size)
     return _fit(image, max_size), native
 

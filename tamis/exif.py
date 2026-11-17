@@ -13,6 +13,8 @@ import os
 import struct
 from datetime import datetime
 
+from .constants import file_of
+
 # EXIF sits near the start of every format handled here.
 _READ_LIMIT = 1 << 20
 
@@ -38,6 +40,7 @@ _EPOCH = datetime(1970, 1, 1)
 
 def read_info(path):
     """{"exposure", "aperture", "iso", "focal", "camera", "lens", "date"}, each only if known."""
+    path = file_of(path)  # a virtual copy's
     try:
         with open(path, 'rb') as file:
             data = file.read(_READ_LIMIT)
@@ -46,8 +49,32 @@ def read_info(path):
         return {}
 
 
+def read_lens(path):
+    """{"make", "model", "lens", "focal" (mm), "aperture" (f-number)}, each only if known: what a lens profile is found by."""
+    path = file_of(path)  # a virtual copy's
+    try:
+        with open(path, 'rb') as file:
+            tags = _find_tags(file.read(_READ_LIMIT))
+    except (OSError, struct.error, ValueError, IndexError, ZeroDivisionError):
+        return {}
+    info = {}
+    for key, tag in (("make", _MAKE), ("model", _MODEL), ("lens", _LENS_MODEL)):
+        value = tags.get(tag)
+        if isinstance(value, str) and value.strip():
+            info[key] = value.strip()
+    for key, tag in (("focal", _FOCAL_LENGTH), ("aperture", _F_NUMBER)):
+        try:
+            value = _ratio(tags.get(tag))
+        except ZeroDivisionError:
+            value = None
+        if value:
+            info[key] = float(value)
+    return info
+
+
 def _exif_time(path):
     """Seconds of EXIF's DateTimeOriginal, with its fraction, None if the file has no valid one."""
+    path = file_of(path)  # a virtual copy's
     try:
         with open(path, 'rb') as file:
             tags = _find_tags(file.read(_READ_LIMIT))
@@ -363,6 +390,7 @@ def export_segment(path, size):
     b'' if the source can't be read; anything that doesn't fit a JPEG segment
     is dropped, GPS first, then the copied tags.
     """
+    path = file_of(path)  # a virtual copy's
     try:
         with open(path, 'rb') as file:
             ifds = _source_ifds(file.read(_READ_LIMIT))

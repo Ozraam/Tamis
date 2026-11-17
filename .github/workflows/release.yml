@@ -2,6 +2,8 @@ name: Release
 
 # Pushing a tag such as v0.2.0 builds Tamis.app, wraps it in a DMG and a zip, and
 # publishes them as a GitHub release. The tag must match pyproject.toml's version.
+# Once the release exists, Linux and Windows builds (unsigned, dist/Tamis/ as a
+# .tar.gz and a .zip) are added to it; if one of them fails, the macOS release stays.
 #
 # No Apple Developer account is needed: the app is signed ad hoc and not notarized,
 # so Gatekeeper blocks it the first time (the release notes say how to open it).
@@ -25,8 +27,8 @@ jobs:
     env:
       SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: pip install -e ".[build,dev]"
@@ -85,8 +87,61 @@ jobs:
           else
             : > "$notes"
           fi
+          cat >> "$notes" <<'NOTES'
+
+          **Linux and Windows:** unpack the archive and run `Tamis` (or `Tamis.exe`) from the `Tamis` folder. These
+          builds aren't signed (Windows SmartScreen warns the first time: **More info › Run anyway**) and get less
+          testing than the macOS app.
+          NOTES
           gh release create "$GITHUB_REF_NAME" dist/Tamis-*.dmg dist/Tamis-*.zip \
             --title "Tamis ${GITHUB_REF_NAME#v}" --notes-file "$notes" --generate-notes
       - name: Remove the keychain
         if: always() && env.SIGNING == 'true'
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  # Added to the release the macOS job published (it checks the tag and runs the tests).
+  others:
+    needs: macos
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install Qt's system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0
+      - run: pip install -e ".[build]"
+      - run: ./scripts/build_app.sh
+      - name: Package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          cd dist
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test -f Tamis/Tamis.exe
+            archive="Tamis-$version-windows.zip"
+            7z a -tzip "$archive" Tamis
+          else
+            test -f Tamis/Tamis
+            # tar keeps the executable bits, which a zip from here wouldn't.
+            archive="Tamis-$version-linux.tar.gz"
+            tar -czf "$archive" Tamis
+          fi
+          echo "ARCHIVE=dist/$archive" >> "$GITHUB_ENV"
+      - name: Add to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber

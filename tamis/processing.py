@@ -16,7 +16,7 @@ from PyQt6.QtCore import QEventLoop, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import QDialog, QProgressDialog
 
 from . import exportsettings, lut, metadata, watermark
-from .constants import KEEP, REJECT, REJECT_DIR
+from .constants import KEEP, REJECT, REJECT_DIR, copy_path
 from .editing import export_photo
 from .exportsettings import ExportSettings
 from .fileops import (
@@ -299,7 +299,8 @@ class ProcessingMixin:
             return os.path.normcase(os.path.abspath(path))
 
         written = {key(dest) for dest in thread.exported}
-        owners = {path: photo for photo in self.model.photos for path in photo.files}
+        owners = {path: photo for photo in self.model.photos if not photo.copy for path in photo.files}
+        owners.update({photo.path: photo for photo in self.model.photos if photo.copy})  # rendered from its own path
         for photo in self.model.photos:  # a file that was replaced is no longer the export of its former photo
             if photo.exports:
                 photo.exports = [record for record in photo.exports if key(record_path(self.folder, record)) not in written]
@@ -571,15 +572,20 @@ class ProcessingMixin:
         # Locations come from the plan: once Stop is pressed the window is
         # usable again while the last file finishes, so marks may have changed.
         locations = {path: move.status for move in moves for path in (move.src, *move.companions)}
+        # Virtual copies go with their file: their paths follow it.
+        moved = dict(result.moved)
+        for photo in self.model.photos:
+            if photo.copy and photo.file in result.moved:
+                moved[photo.path] = copy_path(result.moved[photo.file], photo.copy)
         self.model.apply_moves({old: (new, locations[old]) for old, new in result.moved.items()})
         self.loader.rename_paths(result.moved)
-        self.editor.rename_paths(result.moved)
-        self.edit_thumbnails.rename_paths(result.moved)
+        self.editor.rename_paths(moved)
+        self.edit_thumbnails.rename_paths(moved)
         self.xmp_dirty = {result.moved.get(path, path) for path in self.xmp_dirty}
         self.xmp_metadata_dirty = {result.moved.get(path, path) for path in self.xmp_metadata_dirty}
         self.moved_keys.update(relative_key(self.folder, old) for old in result.moved)
         # Undo entries name photos by path: they follow them, so a mark can still be undone (the files move on the next run).
-        self.undo_stack = [[(result.moved.get(path, path), name, value) for path, name, value in undo] for undo in self.undo_stack]
+        self.undo_stack = [[(moved.get(path, path), name, value) for path, name, value in undo] for undo in self.undo_stack]
         self.save_session()
         self._on_statuses_changed([])
         self.analyzer.restart()  # what was running has the old paths; results are kept by file, so little is lost

@@ -58,6 +58,9 @@ class ImageView(QWidget):
         self._zoomed = False
         self._center = QPointF(0.5, 0.5)  # zoom focus, relative to the image
         self._drag_from = None
+        self._tool = None  # an edit tool working on the photo (edittools.py), or None
+        self._mask_overlay = None  # the selected mask, drawn in red over the photo
+        self.setMouseTracking(True)
         self.setMinimumSize(120, 120)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
@@ -91,6 +94,38 @@ class ImageView(QWidget):
         if pixmap is not self._overlay:
             self._overlay = pixmap
             self.update()
+
+    def set_mask_overlay(self, pixmap):
+        if pixmap is not self._mask_overlay:
+            self._mask_overlay = pixmap
+            self.update()
+
+    def set_tool(self, tool):
+        """Let `tool` (see edittools.Tool) take the mouse over the photo; None gives it back to zoom and pan."""
+        self._tool = tool
+        self._update_cursor()
+        self.update()
+
+    @property
+    def tool(self):
+        return self._tool
+
+    def image_rect(self):
+        """Where the photo is drawn, None if there is none."""
+        if self._pixmap is None:
+            return None
+        return self._zoom_rect() if self._zoomed else QRectF(self._fit_rect())
+
+    def image_size(self):
+        """The size of the photo shown (its own, not the preview's), None if there is none."""
+        if self._pixmap is None:
+            return None
+        return QSize(self._native) if self._native is not None else self._pixmap.size()
+
+    def _tool_point(self, position):
+        rect = self.image_rect()
+        self._tool.rect = rect  # what the tool measures in pixels, even before it was drawn
+        return (position.x() - rect.x()) / rect.width(), (position.y() - rect.y()) / rect.height()
 
     def set_clipping(self, pixmap, tag=None):
         """`tag`: what the overlay is of. While a new one is made (None), that of the same `tag` stays up."""
@@ -312,6 +347,9 @@ class ImageView(QWidget):
     def _update_cursor(self):
         if self._crop is not None:
             return  # follows the handle under the mouse
+        if self._tool is not None and self._pixmap is not None:
+            self.setCursor(self._tool.cursor)
+            return
         if self._zoomed and self._pixmap is not None:
             self.setCursor(Qt.CursorShape.ClosedHandCursor if self._drag_from else Qt.CursorShape.OpenHandCursor)
         else:
@@ -327,10 +365,24 @@ class ImageView(QWidget):
         if self._crop is not None:
             self.crop_confirmed.emit()
             return
+        if self._tool is not None and self._pixmap is not None and self._tool.handles_double_click:
+            return
         self.toggle_zoom(event.position().toPoint())
+
+    def _tool_takes(self, event):
+        """Whether the tool gets this mouse event: Space held, or the middle button, still pans a zoomed photo."""
+        return self._tool is not None and self._pixmap is not None and self._crop is None and self._drag_from is None
 
     def mousePressEvent(self, event):
         self.clicked.emit()
+        if self._tool_takes(event) and event.button() == Qt.MouseButton.LeftButton:
+            self._tool.press(*self._tool_point(event.position()), event.modifiers())
+            self.update()
+            return
+        if self._crop is None and self._zoomed and event.button() == Qt.MouseButton.MiddleButton and self._pixmap is not None:
+            self._drag_from = event.position()
+            self._update_cursor()
+            return
         if self._crop is not None:
             if self._pixmap is not None and event.button() == Qt.MouseButton.LeftButton:
                 handle = self._crop_handle_at(event.position())
@@ -355,6 +407,11 @@ class ImageView(QWidget):
             if self._pixmap is not None:
                 self._update_crop_cursor(event.position())
             return
+        if self._tool_takes(event):
+            pressed = bool(event.buttons() & Qt.MouseButton.LeftButton)
+            self._tool.move(*self._tool_point(event.position()), event.modifiers(), pressed)
+            self.update()
+            return
         if self._drag_from is None:
             return
         rect = self._zoom_rect()
@@ -367,7 +424,17 @@ class ImageView(QWidget):
         self.update()
         self.view_changed.emit(True, self._center)
 
+    def leaveEvent(self, event):
+        if self._tool is not None:
+            self._tool.leave()
+            self.update()
+        super().leaveEvent(event)
+
     def mouseReleaseEvent(self, event):
+        if self._tool_takes(event) and event.button() == Qt.MouseButton.LeftButton:
+            self._tool.release(*self._tool_point(event.position()), event.modifiers())
+            self.update()
+            return
         if self._crop is not None:
             self._crop_drag = None
             if self._pixmap is not None:
@@ -408,6 +475,10 @@ class ImageView(QWidget):
             if self._crop is not None:
                 self._draw_crop(painter, fit)
                 return
+        if self._tool is not None:
+            painter.save()
+            self._tool.paint(painter, target)
+            painter.restore()
 
         visible = target.intersected(QRectF(self.rect()))
         color = STATUS_COLORS.get(self._status)
@@ -428,7 +499,7 @@ class ImageView(QWidget):
 
     def _draw_overlays(self, painter, target):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        for overlay in (self._clipping, self._overlay):
+        for overlay in (self._clipping, self._mask_overlay, self._overlay):
             if overlay is not None:
                 painter.drawPixmap(target, overlay, QRectF(overlay.rect()))
 

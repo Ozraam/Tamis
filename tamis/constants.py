@@ -5,8 +5,29 @@ STANDARD_EXTENSIONS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.tif', '.tif
 SUPPORTED_EXTENSIONS = RAW_EXTENSIONS | STANDARD_EXTENSIONS
 
 
+# A virtual copy is a photo of its own on the files of another: its path is the file's, then COPY_MARK and
+# its number. No file name can hold a NUL, so the two never mix up, and opening a copy's path fails loudly.
+COPY_MARK = "\0"
+
+
+def file_of(path):
+    """The file a photo's path is of: `path` itself, unless it is a virtual copy's."""
+    return path.split(COPY_MARK, 1)[0]
+
+
+def copy_number(path):
+    """0 for a photo, n for its virtual copy n."""
+    _file, mark, number = path.partition(COPY_MARK)
+    return int(number) if mark and number.isdigit() else 0
+
+
+def copy_path(path, number):
+    """The path of virtual copy `number` (0: the photo itself) of the photo whose file is `path`."""
+    return f"{file_of(path)}{COPY_MARK}{number}" if number else file_of(path)
+
+
 def is_raw(path):
-    return os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
+    return os.path.splitext(file_of(path))[1].lower() in RAW_EXTENSIONS
 
 
 KEEP = "keep"

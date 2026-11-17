@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from . import __version__, bursts, develop, exportsettings, faces, logs, metadata, shortcuts, updates, xmp
+from .advancedui import AdvancedEditingMixin
 from .analysis import PhotoAnalyzer
 from .constants import (
     APP_NAME,
@@ -87,7 +88,7 @@ XMP_MARKS = (
 MARK_LABELS = {KEEP: "Green", REJECT: "Red"}
 
 
-class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMainWindow):
+class TamisApp(FolderMixin, NavigationMixin, EditingMixin, AdvancedEditingMixin, ProcessingMixin, QMainWindow):
     def __init__(self, plugins_dir=None, cache_dir=None, presets_file=None, check_updates=True):
         super().__init__()
         self.setWindowTitle("Tamis")
@@ -139,6 +140,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             self.export_scope = "all"
 
         cache_dir = cache_dir or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
+        self.cache_dir = cache_dir
         thumbnail_cache = ThumbnailCache(os.path.join(cache_dir, "thumbnails"))
         self.loader = ImageLoader(self, thumbnail_cache)
         self.loader.preview_loaded.connect(self._on_image_ready)
@@ -196,6 +198,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         self.scan_started = -math.inf
 
         self._build_ui()
+        self._init_advanced(cache_dir)
         self.analyzer.progressed.connect(self.stats.set_analysis_progress)
         self.shortcut_keys = shortcuts.load(self.settings)
         self._build_shortcuts()
@@ -519,6 +522,9 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
             "import": self.import_photos,
             "refresh": self.refresh,
             "export": self.export_photos,
+            "spots": lambda: self.set_edit_tool("" if self.edit_tool == "spots" else "spots"),
+            "virtual_copy": self.create_virtual_copy,
+            "remove_copy": self.remove_virtual_copies,
         }
         for stars in range(6):
             slots[f"rate_{stars}"] = lambda stars=stars: self.rate(stars)
@@ -642,6 +648,8 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         clipping = self.show_clipping and shown is not None and not self.cropping
         view.set_clipping(self.tones.clipping(shown) if clipping else None, photo.path if clipping else None)
         view.set_note("Before" if self._showing_before(photo) else "")
+        if view is self.image_view:
+            self._show_mask_overlay(photo)
         if row == self.current_row and self.edit_panel.isVisible():
             if pixmap is None:
                 self.edit_panel.histogram.set_tone(None)
@@ -650,6 +658,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
                 tone = self.tones.tone(pixmap)
                 if tone is not None:
                     self.edit_panel.histogram.set_tone(tone)
+                    self.edit_panel.set_histogram_counts(tone.counts)
 
     def _info_lines(self, photo):
         lines = summary(self.loader.info(photo.path))
@@ -666,7 +675,8 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         return lines
 
     def _is_shown(self, path):
-        return any(self.model.photo(row).path == path for row in self._shown_rows())
+        """Whether the photo `path` is shown, or one on that file (the loader speaks of files, not virtual copies)."""
+        return any(path in (self.model.photo(row).path, self.model.photo(row).file) for row in self._shown_rows())
 
     def _on_image_ready(self, path):
         if self._is_shown(path):
@@ -988,7 +998,7 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
 
     def _request_analysis(self):
         """Ask for what the current options need, and nothing more: reading every file of a card takes a while."""
-        photos = self.model.photos
+        photos = [photo for photo in self.model.photos if not photo.copy]  # copies get their file's results
         capture = photos if self.sort_order == "date" or self.show_bursts else []
         if self.sort_order == "sharpness" or self.gallery_toolbar.focus_combo.currentData() != StatusFilterProxy.ALL:
             images = photos
@@ -997,12 +1007,13 @@ class TamisApp(FolderMixin, NavigationMixin, EditingMixin, ProcessingMixin, QMai
         self.analyzer.request(capture, images, photos if self.detect_faces else [])
 
     def _on_analyzed(self, path, results):
-        row = self.model.row_of(path)
-        if row == -1:
+        rows = self.model.rows_of_file(path)  # a photo's virtual copies are the same picture
+        if not rows:
             return
-        photo = self.model.photo(row)
-        for name, value in results.items():
-            setattr(photo, name, faces.faces_from_json(value) if name == "faces" else value)
+        for row in rows:
+            photo = self.model.photo(row)
+            for name, value in results.items():
+                setattr(photo, name, faces.faces_from_json(value) if name == "faces" else value)
         if not self.analysis_timer.isActive():
             self.analysis_timer.start()
         shown = self._shown_rows()

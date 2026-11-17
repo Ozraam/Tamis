@@ -51,12 +51,17 @@ class PhotoInfo:
     label: str | None
     edit: dict
     metadata: dict = field(default_factory=dict)  # "title", "caption", "keywords", those that are set
+    # A virtual copy (copy > 0) is a photo of its own on the file of another: its `path` names it, `file` is
+    # the file to read (the same as `path` for any other photo).
+    file: str = ""
+    copy: int = 0
 
     @classmethod
     def of(cls, photo):
         return cls(
             photo.path, photo.name, tuple(photo.files), photo.status, photo.location,
             photo.rating, photo.label, copy.deepcopy(photo.edit), copy.deepcopy(photo.metadata),
+            photo.file, photo.copy,
         )
 
 
