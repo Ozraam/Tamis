@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, QSize, Qt, QTimer  # noqa: E402
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, QSize, Qt, QThreadPool, QTimer  # noqa: E402
 from PyQt6.QtGui import QColor, QImage, QKeySequence, QPixmap, QWheelEvent  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog, QProgressDialog, QPushButton  # noqa: E402
@@ -59,6 +59,8 @@ def window(qapp, tmp_path, tmp_path_factory):
     assert QTest.qWaitForWindowActive(win)
     open_folder(win, str(tmp_path))
     wait_for_image(win)
+    # Tests change these files: on Windows a file a worker still has open can't be replaced or deleted.
+    assert wait_until(lambda: workers_idle(win))
     yield win
     win.close()
     win.deleteLater()
@@ -73,6 +75,11 @@ def open_folder(win, folder, **kwargs):
 def refresh(win, auto=False):
     win.refresh(auto)
     assert wait_until(lambda: not win.scanner.busy)
+
+
+def workers_idle(win):
+    """Whether no background engine of the window is reading or rendering anything."""
+    return all(pool.activeThreadCount() == 0 for pool in win.findChildren(QThreadPool))
 
 
 def wait_for_image(win):
