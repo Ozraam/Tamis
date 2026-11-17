@@ -523,13 +523,12 @@ class EditPanel(QFrame):
         # Vibrance and the HSL mixer
         section = self._section(layout, "Colour Mixer")
         section.content.addLayout(self._slider_grid((("vibrance", "Vibrance", _SIGNED, 1),)))
-        mixer_row = QHBoxLayout()
         self.mixer_mode = Segmented(["Hue", "Saturation", "Luminance"])
-        self.target_button = self._tool_button("◎", "target", "Drag up or down on the photo to change the colour under the pointer")
-        self.target_button.setFixedWidth(36)
-        mixer_row.addWidget(self.mixer_mode, 1)
-        mixer_row.addWidget(self.target_button)
-        section.content.addLayout(mixer_row)
+        self.target_button = self._tool_button(
+            "◎  Drag on the Photo", "target", "Drag up or down on the photo to change the colour under the pointer"
+        )
+        section.content.addWidget(self.mixer_mode)
+        section.content.addWidget(self.target_button)
         self.mixer_pages = QStackedWidget()
         for part in ("hue", "sat", "lum"):
             page = QWidget()

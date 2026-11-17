@@ -12,7 +12,9 @@ from .constants import COLOR_BORDER
 
 
 def shrinkable(widget):
-    """Let `widget` be narrower than its text, so a row of them fits the panel."""
+    """Let a row of `widget`s share the panel's width: a button gets little padding, so its text still fits."""
+    if isinstance(widget, QPushButton) and not widget.objectName():
+        widget.setObjectName("Compact")
     widget.setMinimumWidth(10)
     widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
     return widget

@@ -43,6 +43,7 @@ QPushButton#Primary {{ background: {COLOR_ACCENT}; border-color: {COLOR_ACCENT};
 QPushButton#Primary:hover {{ background: #2563eb; }}
 QPushButton#Primary:disabled {{ background: #1e3a8a; border-color: #1e3a8a; color: #9ca3af; }}
 QPushButton#Chip {{ border-radius: 12px; padding: 3px 12px; }}
+QPushButton#Compact {{ padding: 6px 2px; }}
 QPushButton#Chip:checked {{ background: {COLOR_ACCENT}; border-color: {COLOR_ACCENT}; color: white; }}
 QPushButton#Chip::menu-indicator {{ image: none; width: 0; }}
 
