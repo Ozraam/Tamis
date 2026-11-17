@@ -2427,6 +2427,7 @@ def test_offline_says_nothing_unless_asked(window, monkeypatch):
 def test_about_checks_for_updates_now(window, monkeypatch):
     from tamis.widgets import AboutDialog
 
+    monkeypatch.setattr("tamis.app.__version__", "0.1.0")  # as fake_github pins the checker's
     asked = fake_github(window, monkeypatch, release_answer("v0.1.0"))
     texts = []
 
